@@ -186,6 +186,18 @@ class SIDDescriptor(ProtectionDescriptor):
     type: ProtectionDescriptorType = dataclasses.field(init=False, default=ProtectionDescriptorType.SID)
 
     def get_target_sd(self) -> bytes:
+        """Build the KDF target security descriptor for this SID.
+
+        The result is a pure function of the SID string. It is mixed into the
+        KDF as the ``SD`` context in ``compute_l1_key`` and therefore binds the
+        derived key material to that descriptor. It is not an authorization
+        decision and carries no information about the caller.
+
+        The DACL contains an ACE for the target SID with mask 3 and a final
+        ACE for S-1-1-0 (World) with mask 2. Owner and group are S-1-5-18
+        (SYSTEM). These values mirror the descriptor Microsoft uses when it
+        computes seed key values on the server side.
+        """
         # Build the target security descriptor from the SID passed in. This SD
         # contains an ACE per target user with a mask of 0x3 and a final ACE of
         # the current user with a mask of 0x2. When viewing this over the wire

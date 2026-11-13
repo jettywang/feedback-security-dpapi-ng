@@ -10,6 +10,13 @@ It is designed to replicate the behaviour of [NCryptUnprotectSecret](https://lea
 This can be used on non-Windows hosts to de-/encrypt DPAPI NG protected secrets, like PFX user protected password, or LAPS encrypted password.
 It can either decrypt any DPAPI NG blobs using an offline copy of the domain's root key or de-/encrypt by using the credentials of the supplied user to retrieve the required information over RPC.
 
+> **Offline boundary**: a preloaded root key makes the SID in the protection
+> descriptor a KDF input, not a caller authorization check. The domain only
+> decides authorization during an online `GetKey`; a `KeyCache` hit is local
+> decryption with no authentication. See
+> [docs/offline-recovery-boundary.md](docs/offline-recovery-boundary.md) before
+> building an offline restore service.
+
 Currently only these protection descriptors are supported:
 
 |Type|Purpose|
@@ -190,8 +197,14 @@ cache.load_key(
     public_key_length=2048,             # msKds-PublicKeyLength
 )
 
-dpapi_ng.ncrypt_unprotect_secret(b"...", cache=cache)
+dpapi_ng.ncrypt_unprotect_secret(b"...", cache=cache, cache_only=True)
 ```
+
+Pass `cache_only=True` for offline recovery. Without it, a cache miss falls
+back to a DNS lookup and an online `GetKey`, which re-enables the domain
+authorization check (and requires network access). With it, a miss raises a
+`ValueError` instead. `ncrypt_protect_secret` and the async variants accept the
+same flag.
 
 Currently the `SP800_108_CTR_HMAC` KDF algorithm and `DH`, `ECDH_P256`, and `ECDH_P384` secret agreement algorithms have been tested to work.
 The `ECDH_P521` secret agreement algorithm should also work but has been untested as a test environment cannot be created with it right now.

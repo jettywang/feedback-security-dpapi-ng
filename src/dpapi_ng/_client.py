@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import time
 import typing as t
 import uuid
@@ -356,11 +357,18 @@ class KeyCache:
     This is a cache used to store the KDS keys. It can be used with
     :meth:`async_ncrypt_unprotect_secret` and :meth:`ncrypt_unprotect_secret`
     to avoid any extra RPC calls if the data was already retrieved.
+
+    The cache is keyed by ``(root_key_id, target_security_descriptor, l0)``;
+    it stores no caller identity and makes no authorization decision. Treat a
+    cache instance as a tenant boundary: do not share one between callers that
+    must not decrypt each other's blobs, because a hit bypasses the online
+    GetKey authorization check.
     """
 
     def __init__(self) -> None:
         self._root_keys: t.Dict[uuid.UUID, RootKey] = {}
         self._seed_keys: t.Dict[uuid.UUID, t.Dict[bytes, t.Dict[int, GroupKeyEnvelope]]] = {}
+        self._root_key_fingerprints: t.Dict[uuid.UUID, bytes] = {}
 
     def load_key(
         self,
@@ -470,6 +478,29 @@ class KeyCache:
             public_key_length=public_key_length,
         )
 
+        # A root key id is not a version. If the same id is reloaded with
+        # different material (or parameters), any seed keys already derived
+        # from the old definition must not satisfy a subsequent lookup.
+        fingerprint = hashlib.sha256(
+            b"\x00".join(
+                [
+                    key,
+                    version.to_bytes(4, byteorder="little"),
+                    kdf_algorithm.encode("utf-8"),
+                    kdf_parameters or b"",
+                    secret_algorithm.encode("utf-8"),
+                    secret_parameters or b"",
+                    private_key_length.to_bytes(4, byteorder="little"),
+                    public_key_length.to_bytes(4, byteorder="little"),
+                ]
+            )
+        ).digest()
+
+        previous_fingerprint = self._root_key_fingerprints.get(root_key_id)
+        if previous_fingerprint is not None and previous_fingerprint != fingerprint:
+            self._seed_keys.pop(root_key_id, None)
+        self._root_key_fingerprints[root_key_id] = fingerprint
+
     def _get_key(
         self,
         target_sd: bytes,
@@ -549,6 +580,7 @@ def ncrypt_unprotect_secret(
     password: t.Optional[str] = None,
     auth_protocol: str = "negotiate",
     cache: t.Optional[KeyCache] = None,
+    cache_only: bool = False,
 ) -> bytes:
     """Decrypt DPAPI-NG Blob.
 
@@ -576,9 +608,18 @@ def ncrypt_unprotect_secret(
             ``negotiate`` but can be ``kerberos`` or ``ntlm``.
         cache: Optional cache that is used as the key source to avoid making
             the RPC call.
+        cache_only: Fail without contacting a DC when the required key is not
+            present in ``cache``. This is the safe mode for offline recovery.
 
     Returns:
         bytes: The decrypt DPAPI-NG data.
+
+    Note:
+        When the key comes from ``cache``, no domain controller is involved,
+        so the SID in the blob's protection descriptor only selects the KDF
+        input; it does not prove the caller is authorised. Authorization is
+        only enforced by an online GetKey call. Use ``cache_only`` for offline
+        recovery and perform authorization/audit checks in the caller.
 
     Raises:
         ValueError: An invalid data structure was found.
@@ -601,6 +642,11 @@ def ncrypt_unprotect_secret(
     )
 
     if not rk:
+        if cache_only:
+            raise ValueError(
+                "The required key is not present in the cache and cache_only is enabled; "
+                "no domain controller was contacted"
+            )
         if not server:
             srv = lookup_dc(blob.key_identifier.domain_name)
             server = srv.target
@@ -633,6 +679,7 @@ def ncrypt_protect_secret(
     password: t.Optional[str] = None,
     auth_protocol: str = "negotiate",
     cache: t.Optional[KeyCache] = None,
+    cache_only: bool = False,
 ) -> bytes:
     """Encrypt DPAPI-NG Blob.
 
@@ -668,6 +715,8 @@ def ncrypt_protect_secret(
         cache: Optional cache that is used as the key source to avoid making
             the RPC call. This only works if root_key_identifier is also
             specified.
+        cache_only: Fail without contacting a DC when the required key is not
+            present in ``cache``. This is the safe mode for offline use.
 
     Returns:
         bytes: The encrypted DPAPI-NG data.
@@ -691,6 +740,11 @@ def ncrypt_protect_secret(
     rk = _get_protection_gke_from_cache(root_key_identifier, sd, cache)
 
     if not rk:
+        if cache_only:
+            raise ValueError(
+                "The required key is not present in the cache and cache_only is enabled; "
+                "no domain controller was contacted"
+            )
         if not server:
             srv = lookup_dc(domain_name)
             server = srv.target
@@ -720,6 +774,7 @@ async def async_ncrypt_unprotect_secret(
     password: t.Optional[str] = None,
     auth_protocol: str = "negotiate",
     cache: t.Optional[KeyCache] = None,
+    cache_only: bool = False,
 ) -> bytes:
     """Decrypt DPAPI-NG Blob.
 
@@ -747,9 +802,18 @@ async def async_ncrypt_unprotect_secret(
             ``negotiate`` but can be ``kerberos`` or ``ntlm``.
         cache: Optional cache that is used as the key source to avoid making
             the RPC call.
+        cache_only: Fail without contacting a DC when the required key is not
+            present in ``cache``. This is the safe mode for offline recovery.
 
     Returns:
         bytes: The decrypt DPAPI-NG data.
+
+    Note:
+        When the key comes from ``cache``, no domain controller is involved,
+        so the SID in the blob's protection descriptor only selects the KDF
+        input; it does not prove the caller is authorised. Authorization is
+        only enforced by an online GetKey call. Use ``cache_only`` for offline
+        recovery and perform authorization/audit checks in the caller.
 
     Raises:
         ValueError: An invalid data structure was found.
@@ -771,6 +835,11 @@ async def async_ncrypt_unprotect_secret(
         blob.key_identifier.l2,
     )
     if not rk:
+        if cache_only:
+            raise ValueError(
+                "The required key is not present in the cache and cache_only is enabled; "
+                "no domain controller was contacted"
+            )
         if not server:
             srv = await async_lookup_dc(blob.key_identifier.domain_name)
             server = srv.target
@@ -803,6 +872,7 @@ async def async_ncrypt_protect_secret(
     password: t.Optional[str] = None,
     auth_protocol: str = "negotiate",
     cache: t.Optional[KeyCache] = None,
+    cache_only: bool = False,
 ) -> bytes:
     """Encrypt DPAPI-NG Blob.
 
@@ -861,6 +931,11 @@ async def async_ncrypt_protect_secret(
     rk = _get_protection_gke_from_cache(root_key_identifier, sd, cache)
 
     if not rk:
+        if cache_only:
+            raise ValueError(
+                "The required key is not present in the cache and cache_only is enabled; "
+                "no domain controller was contacted"
+            )
         if not server:
             srv = await async_lookup_dc(domain_name)
             server = srv.target

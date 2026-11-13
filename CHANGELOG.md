@@ -2,6 +2,12 @@
 
 ## 0.3.0 - TBD
 
++ Added `cache_only` to the sync and async protect/unprotect functions so an
+  offline caller fails closed instead of falling back to DNS and online GetKey
++ Invalidate derived seed keys when a root key id is reloaded with different
+  material or parameters
++ Documented the offline recovery boundary: the protection descriptor is KDF
+  input, while caller authorization only happens during online GetKey
 + Dropped end of life Python versions 3.7, and 3.8
 + Added explicit support for Python 3.12, and 3.13
 + Added mininum version for the `cryptography` dep at `>= 3.4.4`
