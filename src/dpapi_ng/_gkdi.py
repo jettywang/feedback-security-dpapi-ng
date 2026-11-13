@@ -689,12 +689,56 @@ def compute_l1_key(
     )
 
 
+def _validate_l2_request(
+    request_l1: int,
+    request_l2: int,
+    rk: GroupKeyEnvelope,
+) -> None:
+    # MS-GKDI only ever produces L1/L2 indices in the range 0-31 and keys can
+    # only be derived backwards in time. Validate that the requested indices are
+    # reachable from the seed values in the envelope before any derivation
+    # occurs, otherwise the backwards walking loops below never terminate.
+    if not (0 <= rk.l1 <= 31):
+        raise ValueError(f"Envelope L1 index {rk.l1} is outside the valid range of 0-31")
+
+    if not (0 <= rk.l2 <= 31):
+        raise ValueError(f"Envelope L2 index {rk.l2} is outside the valid range of 0-31")
+
+    if not (0 <= request_l1 <= 31):
+        raise ValueError(f"Requested L1 index {request_l1} is outside the valid range of 0-31")
+
+    if not (0 <= request_l2 <= 31):
+        raise ValueError(f"Requested L2 index {request_l2} is outside the valid range of 0-31")
+
+    if request_l1 == rk.l1:
+        # No L1 fallback is needed. The envelope only holds a single L2 seed, so
+        # indices newer than the one it contains cannot be derived from it.
+        if request_l2 > rk.l2:
+            raise ValueError(
+                f"L2 index {request_l2} is not reachable from the seed L2 index {rk.l2} "
+                f"for L1 index {request_l1}"
+            )
+
+    else:
+        # Falling back across an L1 boundary. Per MS-GKDI 2.2.4 the l1_key seed
+        # is for (L0, rk.l1 - 1, -1) unless rk.l2 == 31 in which case it is for
+        # (L0, rk.l1, -1). A requested L1 newer than that seed cannot be reached.
+        seed_l1 = rk.l1 if rk.l2 == 31 else rk.l1 - 1
+        if request_l1 > seed_l1:
+            raise ValueError(
+                f"L1 index {request_l1} is not reachable from the seed L1 index {seed_l1} "
+                f"on envelope (L1 {rk.l1}, L2 {rk.l2})"
+            )
+
+
 def compute_l2_key(
     algorithm: hashes.HashAlgorithm,
     request_l1: int,
     request_l2: int,
     rk: GroupKeyEnvelope,
 ) -> bytes:
+    _validate_l2_request(request_l1, request_l2, rk)
+
     l1 = rk.l1
     l1_key = rk.l1_key
     l2 = rk.l2

@@ -617,3 +617,233 @@ def test_compute_l2_key(
 def test_compute_kek_invalid_algorithm() -> None:
     with pytest.raises(NotImplementedError, match="Unknown secret agreement algorithm 'test'"):
         gkdi.compute_kek_from_public_key(hashes.SHA256(), b"", "test", None, b"", 0)
+
+
+class _CountingKDF:
+    """Deterministic KDF stand-in that records how many times it was called."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def __call__(
+        self,
+        algorithm: hashes.HashAlgorithm,
+        secret: bytes,
+        label: bytes,
+        context: bytes,
+        length: int,
+    ) -> bytes:
+        self.calls += 1
+        return bytes([self.calls % 256]) * length
+
+
+def _make_seed_envelope(
+    l1: int,
+    l2: int,
+) -> gkdi.GroupKeyEnvelope:
+    return gkdi.GroupKeyEnvelope(
+        version=1,
+        flags=0,
+        l0=361,
+        l1=l1,
+        l2=l2,
+        root_key_identifier=uuid.UUID(int=0),
+        kdf_algorithm="SP800_108_CTR_HMAC",
+        kdf_parameters=gkdi.KDFParameters("SHA512").pack(),
+        secret_algorithm="",
+        secret_parameters=b"",
+        private_key_length=0,
+        public_key_length=0,
+        domain_name="",
+        forest_name="",
+        l1_key=b"\x10" * 64,
+        l2_key=b"\x20" * 64,
+    )
+
+
+@pytest.mark.parametrize(
+    "request_l1, request_l2, seed_l1, seed_l2, expected_calls",
+    [
+        # Only a single L2 key is held.
+        (2, 6, 2, 6, 0),
+        (2, 4, 2, 6, 2),
+        (2, 0, 2, 6, 6),
+        # L2 == 31 forces a reseed from the L1 seed before walking down.
+        (5, 31, 5, 31, 1),
+        (5, 30, 5, 31, 2),
+        (5, 0, 5, 31, 32),
+        # Cross L1 fallback where the envelope already carries an L1 (31) seed.
+        (4, 5, 5, 31, 28),
+        (0, 0, 5, 31, 37),
+        (4, 31, 5, 31, 2),
+        # Cross L1 fallback where the l1_key is for (L0, seed_l1 - 1, -1).
+        (4, 5, 5, 6, 27),
+        (0, 0, 2, 8, 33),
+        (4, 31, 5, 6, 1),
+    ],
+    ids=[
+        "SingleL2Exact",
+        "SingleL2WalkDown",
+        "SingleL2WalkToZero",
+        "ReseedExact",
+        "ReseedOneStep",
+        "ReseedWalkToZero",
+        "CrossL1FromL31Seed",
+        "CrossL1FromL31SeedToZero",
+        "CrossL1FromL31SeedExactL2",
+        "CrossL1FromPriorL1Seed",
+        "CrossL1FromPriorL1SeedToZero",
+        "CrossL1FromPriorL1SeedExactL2",
+    ],
+)
+def test_compute_l2_key_step_counts(
+    monkeypatch: pytest.MonkeyPatch,
+    request_l1: int,
+    request_l2: int,
+    seed_l1: int,
+    seed_l2: int,
+    expected_calls: int,
+) -> None:
+    counting_kdf = _CountingKDF()
+    monkeypatch.setattr(gkdi, "kdf", counting_kdf)
+
+    gkdi.compute_l2_key(
+        hashes.SHA512(),
+        request_l1,
+        request_l2,
+        _make_seed_envelope(seed_l1, seed_l2),
+    )
+
+    assert counting_kdf.calls == expected_calls
+
+
+@pytest.mark.parametrize(
+    "request_l1, request_l2, seed_l1, seed_l2, match",
+    [
+        # Future L1 index that no held seed can walk back from.
+        (6, 0, 5, 31, "L1 index 6 is not reachable from the seed L1 index 5"),
+        (5, 0, 4, 6, "L1 index 5 is not reachable from the seed L1 index 3"),
+        # Future L2 index while staying on the held L1.
+        (2, 7, 2, 6, "L2 index 7 is not reachable from the seed L2 index 6"),
+        # Negative requested indices.
+        (-1, 0, 2, 6, "Requested L1 index -1 is outside the valid range of 0-31"),
+        (2, -1, 2, 6, "Requested L2 index -1 is outside the valid range of 0-31"),
+        # Indices beyond the 5-bit 0-31 range.
+        (32, 0, 5, 31, "Requested L1 index 32 is outside the valid range of 0-31"),
+        (2, 32, 2, 6, "Requested L2 index 32 is outside the valid range of 0-31"),
+        # Malformed envelope indices are rejected as well.
+        (0, 0, 32, 31, "Envelope L1 index 32 is outside the valid range of 0-31"),
+        (0, 0, 2, 32, "Envelope L2 index 32 is outside the valid range of 0-31"),
+        (0, 0, 2, -1, "Envelope L2 index -1 is outside the valid range of 0-31"),
+    ],
+    ids=[
+        "FutureL1FromL31Seed",
+        "FutureL1FromPriorL1Seed",
+        "FutureL2SameL1",
+        "NegativeRequestL1",
+        "NegativeRequestL2",
+        "RequestL1TooLarge",
+        "RequestL2TooLarge",
+        "EnvelopeL1TooLarge",
+        "EnvelopeL2TooLarge",
+        "EnvelopeL2Negative",
+    ],
+)
+def test_compute_l2_key_unreachable_rejected_before_kdf(
+    monkeypatch: pytest.MonkeyPatch,
+    request_l1: int,
+    request_l2: int,
+    seed_l1: int,
+    seed_l2: int,
+    match: str,
+) -> None:
+    counting_kdf = _CountingKDF()
+    monkeypatch.setattr(gkdi, "kdf", counting_kdf)
+
+    with pytest.raises(ValueError, match=match):
+        gkdi.compute_l2_key(
+            hashes.SHA512(),
+            request_l1,
+            request_l2,
+            _make_seed_envelope(seed_l1, seed_l2),
+        )
+
+    assert counting_kdf.calls == 0
+
+
+def test_get_kek_wrong_l0_rejected_before_kdf(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    counting_kdf = _CountingKDF()
+    monkeypatch.setattr(gkdi, "kdf", counting_kdf)
+
+    envelope = _make_seed_envelope(2, 6)
+    key_id = blob.KeyIdentifier(
+        version=1,
+        flags=0,
+        l0=360,
+        l1=2,
+        l2=6,
+        root_key_identifier=uuid.UUID(int=0),
+        key_info=b"\x00" * 32,
+        domain_name="",
+        forest_name="",
+    )
+
+    with pytest.raises(ValueError, match="L0 index 361 does not match the requested L0 index 360"):
+        envelope.get_kek(key_id)
+
+    assert counting_kdf.calls == 0
+
+
+def test_compute_l2_key_real_vector_unchanged() -> None:
+    # A short derivation through the real SHA512 KDF. The expected value is
+    # generated independently with the same seed chain used by the integration
+    # helper (tests/integration/files/generate_seed_keys.py).
+    l1_seed = (
+        b"\xC7\xA2\x2B\x5B\x09\x70\x53\x80"
+        b"\xB4\x5C\xDD\x29\x33\xE0\xFA\xA6"
+        b"\x8E\xA2\xC9\x8A\x3E\x50\x47\x27"
+        b"\x5D\xD3\xB2\xE2\xDC\xCF\x55\x86"
+        b"\xD7\x2A\x58\xA0\x76\x2D\x2E\x5A"
+        b"\x53\x42\x99\xF5\x40\x5E\x31\xEE"
+        b"\x51\x4B\xD4\xE1\x3A\xA2\xF5\x4A"
+        b"\xF0\xC3\x0C\xDB\xC9\xCC\x03\x01"
+    )
+    expected = (
+        b"\x1B\x0F\x11\x3F\x01\x93\x10\xE5"
+        b"\xA8\x4E\xA3\x0B\x3A\xCB\xC6\x58"
+        b"\x21\x79\xC9\xB0\x49\x2B\xA8\x4A"
+        b"\xF6\xA2\x5D\xE3\xCA\x42\x82\xC9"
+        b"\x1B\x50\x3B\x7E\x01\x15\x1E\x29"
+        b"\x27\x72\x93\x07\xDA\x8E\x60\xC6"
+        b"\x4E\x3D\x3A\xFB\x66\x80\x06\xE2"
+        b"\x2F\x2B\xFF\x7F\x7C\x14\xAA\x18"
+    )
+    key_id = uuid.UUID("2e1b932a-4e21-ced3-0b7b-8815aff8335d")
+
+    actual = gkdi.compute_l2_key(
+        hashes.SHA512(),
+        0,
+        0,
+        gkdi.GroupKeyEnvelope(
+            version=1,
+            flags=0,
+            l0=361,
+            l1=0,
+            l2=31,
+            root_key_identifier=key_id,
+            kdf_algorithm="",
+            kdf_parameters=b"",
+            secret_algorithm="",
+            secret_parameters=b"",
+            private_key_length=0,
+            public_key_length=0,
+            domain_name="",
+            forest_name="",
+            l1_key=l1_seed,
+            l2_key=b"",
+        ),
+    )
+
+    assert actual == expected

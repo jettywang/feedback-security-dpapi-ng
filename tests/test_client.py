@@ -13,6 +13,7 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric import ec
 
 import dpapi_ng
+import dpapi_ng._blob as blob
 import dpapi_ng._client as client
 import dpapi_ng._gkdi as gkdi
 
@@ -270,3 +271,122 @@ async def test_async_unprotect_secret(
 
     actual = await dpapi_ng.async_ncrypt_unprotect_secret(data, cache=key_cache)
     assert actual == expected
+
+
+class _CountingKDF:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def __call__(
+        self,
+        algorithm,
+        secret,
+        label,
+        context,
+        length,
+    ) -> bytes:
+        self.calls += 1
+        return bytes([self.calls % 256]) * length
+
+
+def _make_blob(
+    l0: int,
+    l1: int,
+    l2: int,
+) -> blob.DPAPINGBlob:
+    descriptor = blob.ProtectionDescriptor.parse("S-1-5-21-2185496602-3367037166-1388177638-1103")
+    key_id = blob.KeyIdentifier(
+        version=1,
+        flags=0,
+        l0=l0,
+        l1=l1,
+        l2=l2,
+        root_key_identifier=uuid.UUID(int=0),
+        key_info=b"\x00" * 32,
+        domain_name="domain.test",
+        forest_name="domain.test",
+    )
+    return blob.DPAPINGBlob(
+        key_identifier=key_id,
+        protection_descriptor=descriptor,
+        enc_cek=b"\x00" * 40,
+        enc_cek_algorithm=client.AlgorithmOID.AES256_WRAP,
+        enc_cek_parameters=None,
+        enc_content=b"",
+        enc_content_algorithm=client.AlgorithmOID.AES256_GCM,
+        enc_content_parameters=None,
+    )
+
+
+def _make_envelope(
+    l0: int,
+    l1: int,
+    l2: int,
+) -> gkdi.GroupKeyEnvelope:
+    return gkdi.GroupKeyEnvelope(
+        version=1,
+        flags=2,
+        l0=l0,
+        l1=l1,
+        l2=l2,
+        root_key_identifier=uuid.UUID(int=0),
+        kdf_algorithm="SP800_108_CTR_HMAC",
+        kdf_parameters=gkdi.KDFParameters("SHA512").pack(),
+        secret_algorithm="DH",
+        secret_parameters=b"",
+        private_key_length=512,
+        public_key_length=2048,
+        domain_name="domain.test",
+        forest_name="domain.test",
+        l1_key=b"\x10" * 64,
+        l2_key=b"\x20" * 64,
+    )
+
+
+def test_unprotect_rejects_unreachable_cache_seed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The cache holds a seed for (L0, L1=5, L2=6). A negative L2 request passes
+    # the cache freshness check (6 >= -1) but is not a reachable index, so
+    # validation must reject it before any KDF and without a network fallback.
+    key_cache = dpapi_ng.KeyCache()
+    target_sd = blob.ProtectionDescriptor.parse(
+        "S-1-5-21-2185496602-3367037166-1388177638-1103"
+    ).get_target_sd()
+    key_cache._store_key(target_sd, _make_envelope(361, 5, 6))
+
+    # A negative index cannot be serialized, so inject the already-unpacked
+    # blob instead of round-tripping it through pack/unpack.
+    invalid_blob = _make_blob(361, 5, -1)
+    monkeypatch.setattr(blob.DPAPINGBlob, "unpack", classmethod(lambda cls, data: invalid_blob))
+
+    def fail_rpc(*args, **kwargs):
+        raise AssertionError("a cache hit must not fall back to the network")
+
+    monkeypatch.setattr(client, "_sync_get_key", fail_rpc)
+    counting_kdf = _CountingKDF()
+    monkeypatch.setattr(gkdi, "kdf", counting_kdf)
+
+    with pytest.raises(ValueError, match="Requested L2 index -1 is outside the valid range of 0-31"):
+        dpapi_ng.ncrypt_unprotect_secret(b"not-a-real-blob", server="dc.domain.test", cache=key_cache)
+
+    assert counting_kdf.calls == 0
+
+
+def test_unprotect_rejects_unreachable_network_seed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A fresh (empty) cache forces a GetKey RPC. The envelope returned by the
+    # server is validated through the same rule before any derivation runs.
+    key_cache = dpapi_ng.KeyCache()
+    monkeypatch.setattr(client, "_sync_get_key", lambda *args, **kwargs: _make_envelope(361, 5, 6))
+
+    data = _make_blob(361, 5, 7).pack()
+
+    counting_kdf = _CountingKDF()
+    monkeypatch.setattr(gkdi, "kdf", counting_kdf)
+
+    with pytest.raises(ValueError, match="L2 index 7 is not reachable from the seed L2 index 6"):
+        dpapi_ng.ncrypt_unprotect_secret(data, server="dc.domain.test", cache=key_cache)
+
+    assert counting_kdf.calls == 0
