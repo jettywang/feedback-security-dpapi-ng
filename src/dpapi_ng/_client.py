@@ -141,6 +141,7 @@ async def _async_get_key(
     username: t.Optional[str] = None,
     password: t.Optional[str] = None,
     auth_protocol: str = "negotiate",
+    require_header_signing: bool = False,
 ) -> GroupKeyEnvelope:
     rpc = await async_create_rpc_connection(server)
     async with rpc:
@@ -158,6 +159,7 @@ async def _async_get_key(
         username=username,
         password=password,
         auth_protocol=auth_protocol,
+        require_header_signing=require_header_signing,
     )
     async with rpc:
         context_id = _ISD_KEY_CONTEXTS[0].context_id
@@ -184,6 +186,7 @@ def _sync_get_key(
     username: t.Optional[str] = None,
     password: t.Optional[str] = None,
     auth_protocol: str = "negotiate",
+    require_header_signing: bool = False,
 ) -> GroupKeyEnvelope:
     with create_rpc_connection(server) as rpc:
         context_id = _EPM_CONTEXTS[0].context_id
@@ -200,6 +203,7 @@ def _sync_get_key(
         username=username,
         password=password,
         auth_protocol=auth_protocol,
+        require_header_signing=require_header_signing,
     ) as rpc:
         context_id = _ISD_KEY_CONTEXTS[0].context_id
         ack = rpc.bind(contexts=_ISD_KEY_CONTEXTS)
@@ -548,6 +552,7 @@ def ncrypt_unprotect_secret(
     username: t.Optional[str] = None,
     password: t.Optional[str] = None,
     auth_protocol: str = "negotiate",
+    require_header_signing: bool = False,
     cache: t.Optional[KeyCache] = None,
 ) -> bytes:
     """Decrypt DPAPI-NG Blob.
@@ -574,6 +579,9 @@ def ncrypt_unprotect_secret(
         password: The password for the user.
         auth_protocol: The authentication protocol to use, defaults to
             ``negotiate`` but can be ``kerberos`` or ``ntlm``.
+        require_header_signing: Require the RPC header and security trailer to
+            be integrity protected. If the peer does not support header
+            signing the operation fails instead of silently downgrading.
         cache: Optional cache that is used as the key source to avoid making
             the RPC call.
 
@@ -581,7 +589,8 @@ def ncrypt_unprotect_secret(
         bytes: The decrypt DPAPI-NG data.
 
     Raises:
-        ValueError: An invalid data structure was found.
+        ValueError: An invalid data structure was found, or header signing
+            was required but could not be negotiated.
         NotImplementedError: An unknown value was found and has not been
             implemented yet.
 
@@ -615,6 +624,7 @@ def ncrypt_unprotect_secret(
             username=username,
             password=password,
             auth_protocol=auth_protocol,
+            require_header_signing=require_header_signing,
         )
 
     if not rk.is_public_key:
@@ -632,6 +642,7 @@ def ncrypt_protect_secret(
     username: t.Optional[str] = None,
     password: t.Optional[str] = None,
     auth_protocol: str = "negotiate",
+    require_header_signing: bool = False,
     cache: t.Optional[KeyCache] = None,
 ) -> bytes:
     """Encrypt DPAPI-NG Blob.
@@ -665,6 +676,9 @@ def ncrypt_protect_secret(
         password: The password for the user.
         auth_protocol: The authentication protocol to use, defaults to
             ``negotiate`` but can be ``kerberos`` or ``ntlm``.
+        require_header_signing: Require the RPC header and security trailer to
+            be integrity protected. If the peer does not support header
+            signing the operation fails instead of silently downgrading.
         cache: Optional cache that is used as the key source to avoid making
             the RPC call. This only works if root_key_identifier is also
             specified.
@@ -673,7 +687,8 @@ def ncrypt_protect_secret(
         bytes: The encrypted DPAPI-NG data.
 
     Raises:
-        ValueError: An invalid data structure was found.
+        ValueError: An invalid data structure was found, or header signing
+            was required but could not be negotiated.
         NotImplementedError: An unknown value was found and has not been
             implemented yet.
 
@@ -705,6 +720,7 @@ def ncrypt_protect_secret(
             username=username,
             password=password,
             auth_protocol=auth_protocol,
+            require_header_signing=require_header_signing,
         )
 
     if not rk.is_public_key:
@@ -719,6 +735,7 @@ async def async_ncrypt_unprotect_secret(
     username: t.Optional[str] = None,
     password: t.Optional[str] = None,
     auth_protocol: str = "negotiate",
+    require_header_signing: bool = False,
     cache: t.Optional[KeyCache] = None,
 ) -> bytes:
     """Decrypt DPAPI-NG Blob.
@@ -745,6 +762,9 @@ async def async_ncrypt_unprotect_secret(
         password: The password for the user.
         auth_protocol: The authentication protocol to use, defaults to
             ``negotiate`` but can be ``kerberos`` or ``ntlm``.
+        require_header_signing: Require the RPC header and security trailer to
+            be integrity protected. If the peer does not support header
+            signing the operation fails instead of silently downgrading.
         cache: Optional cache that is used as the key source to avoid making
             the RPC call.
 
@@ -752,7 +772,8 @@ async def async_ncrypt_unprotect_secret(
         bytes: The decrypt DPAPI-NG data.
 
     Raises:
-        ValueError: An invalid data structure was found.
+        ValueError: An invalid data structure was found, or header signing
+            was required but could not be negotiated.
         NotImplementedError: An unknown value was found and has not been
             implemented yet.
 
@@ -785,6 +806,7 @@ async def async_ncrypt_unprotect_secret(
             username=username,
             password=password,
             auth_protocol=auth_protocol,
+            require_header_signing=require_header_signing,
         )
 
     if not rk.is_public_key:
@@ -802,6 +824,7 @@ async def async_ncrypt_protect_secret(
     username: t.Optional[str] = None,
     password: t.Optional[str] = None,
     auth_protocol: str = "negotiate",
+    require_header_signing: bool = False,
     cache: t.Optional[KeyCache] = None,
 ) -> bytes:
     """Encrypt DPAPI-NG Blob.
@@ -835,6 +858,9 @@ async def async_ncrypt_protect_secret(
         password: The password for the user.
         auth_protocol: The authentication protocol to use, defaults to
             ``negotiate`` but can be ``kerberos`` or ``ntlm``.
+        require_header_signing: Require the RPC header and security trailer to
+            be integrity protected. If the peer does not support header
+            signing the operation fails instead of silently downgrading.
         cache: Optional cache that is used as the key source to avoid making
             the RPC call. This only works if root_key_identifier is also
             specified.
@@ -843,7 +869,8 @@ async def async_ncrypt_protect_secret(
         bytes: The encrypted DPAPI-NG data.
 
     Raises:
-        ValueError: An invalid data structure was found.
+        ValueError: An invalid data structure was found, or header signing
+            was required but could not be negotiated.
         NotImplementedError: An unknown value was found and has not been
             implemented yet.
 
@@ -875,6 +902,7 @@ async def async_ncrypt_protect_secret(
             username=username,
             password=password,
             auth_protocol=auth_protocol,
+            require_header_signing=require_header_signing,
         )
 
     if not rk.is_public_key:

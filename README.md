@@ -106,6 +106,7 @@ The following kwargs can be used for `ncrypt_unprotect_secret`, `async_ncrypt_un
 * `username`: The username to authenticate as for the RPC connection
 * `password`: The password to authenticate with for the RPC connection
 * `auth_protocol`: The authentication protocol (`negotiate`, `kerberos`, `ntlm`) to use for the RPC connection
+* `require_header_signing`: Require the RPC header and security trailer to be integrity protected. If the domain controller does not negotiate header signing the operation fails instead of only protecting the message body
 * `cache`: A cache to store keys retrieved for future operation
 
 In addition to that, `ncrypt_protect_secret` and `async_ncrypt_protect_secret` take the following additional kwarg.

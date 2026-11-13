@@ -5,9 +5,12 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import enum
 import socket
 import typing as t
 import uuid
+
+import spnego.iov
 
 from ._auth import AuthenticationProvider
 from ._bind import (
@@ -22,12 +25,21 @@ from ._bind import (
 )
 from ._pdu import PDU, DataRep, Fault, PacketFlags, PacketType, PDUHeader, SecTrailer
 from ._request import Request, Response
-from ._verification import VerificationTrailer
+from ._verification import CommandBitmask, CommandFlags, VerificationTrailer
 
 NDR = SyntaxId(uuid.UUID("8a885d04-1ceb-11c9-9fe8-08002b104860"), 2, 0)
 NDR64 = SyntaxId(uuid.UUID("71710533-beba-4937-8319-b5dbef9ccc36"), 1, 0)
 
 T = t.TypeVar("T")
+
+
+class BindState(enum.Enum):
+    """The authentication/binding state of an RPC connection."""
+
+    UNBOUND = enum.auto()
+    BINDING = enum.auto()
+    ESTABLISHED = enum.auto()
+    FAILED = enum.auto()
 
 
 async def async_create_rpc_connection(
@@ -37,6 +49,7 @@ async def async_create_rpc_connection(
     username: t.Optional[str] = None,
     password: t.Optional[str] = None,
     auth_protocol: t.Optional[str] = None,
+    require_header_signing: bool = False,
 ) -> AsyncRpcClient:
     auth_provider = None
     if auth_protocol:
@@ -45,7 +58,7 @@ async def async_create_rpc_connection(
     conn_future = asyncio.open_connection(server, port=port)
     reader, writer = await asyncio.wait_for(conn_future, connection_timeout)
 
-    return AsyncRpcClient(reader, writer, auth_provider)
+    return AsyncRpcClient(reader, writer, auth_provider, require_header_signing=require_header_signing)
 
 
 def create_rpc_connection(
@@ -55,6 +68,7 @@ def create_rpc_connection(
     username: t.Optional[str] = None,
     password: t.Optional[str] = None,
     auth_protocol: t.Optional[str] = None,
+    require_header_signing: bool = False,
 ) -> SyncRpcClient:
     auth_provider = None
     if auth_protocol:
@@ -66,16 +80,169 @@ def create_rpc_connection(
     )
     sock.settimeout(None)
 
-    return SyncRpcClient(sock, auth_provider)
+    return SyncRpcClient(sock, auth_provider, require_header_signing=require_header_signing)
 
 
 class RpcClient:
     def __init__(
         self,
         auth: t.Optional[AuthenticationProvider] = None,
+        *,
+        require_header_signing: bool = False,
     ) -> None:
         self._auth = auth
+        self._require_header_signing = require_header_signing
         self._sign_header = False
+        self._state = BindState.UNBOUND
+        self._previous_header_signing: t.Optional[bool] = None
+
+    @property
+    def header_signing(self) -> bool:
+        """Whether the RPC PDU header and security trailer are integrity protected.
+
+        This is the protection that was actually negotiated with the peer, not
+        just the capability that was advertised by this client. When this is
+        ``False`` only the PDU body is protected by the authentication
+        provider; when it is ``True`` the PDU header and security trailer are
+        also covered by the signature.
+        """
+        return self._sign_header
+
+    @property
+    def header_signing_required(self) -> bool:
+        """Whether this client refuses to continue without header signing."""
+        return self._require_header_signing
+
+    @property
+    def bind_state(self) -> BindState:
+        """The current authentication/binding state of the connection."""
+        return self._state
+
+    def _begin_bind(self) -> None:
+        if self._state == BindState.FAILED:
+            raise ValueError("Cannot bind on a connection that previously failed to bind")
+
+        if self._require_header_signing:
+            if not self._auth:
+                self._state = BindState.FAILED
+                raise ValueError("Header signing requires an authentication provider")
+            if not self._auth.supports_header_signing:
+                self._state = BindState.FAILED
+                raise ValueError("The authentication provider does not support header signing")
+
+        # Track the capability of the previous successful binding so that a
+        # rebind cannot silently weaken the established protection.
+        self._previous_header_signing = self._sign_header if self._state == BindState.ESTABLISHED else None
+        self._sign_header = False
+        self._state = BindState.BINDING
+
+    def _record_negotiation(
+        self,
+        ack: t.Union[BindAck, AlterContextResponse],
+        *,
+        initial: bool,
+    ) -> bool:
+        supported = (
+            bool(ack.header.packet_flags & PacketFlags.PFC_SUPPORT_HEADER_SIGN)
+            and self._auth is not None
+            and self._auth.supports_header_signing
+        )
+
+        if initial:
+            negotiated = supported
+        elif supported != self._sign_header:
+            # Bind and AlterContext must agree on whether header signing is in
+            # use. A changing result is a downgrade/ambiguity, not something
+            # that should silently alter the protection of business requests.
+            self._state = BindState.FAILED
+            raise ValueError("Header signing negotiation is inconsistent between Bind and AlterContext responses")
+        else:
+            negotiated = self._sign_header
+
+        if self._require_header_signing and not negotiated:
+            self._state = BindState.FAILED
+            raise ValueError("Header signing was required but the peer did not negotiate support")
+
+        self._sign_header = negotiated
+        return negotiated
+
+    def _finish_bind(self) -> None:
+        if self._auth and not self._auth.complete:
+            self._state = BindState.FAILED
+            raise ValueError("Authentication did not complete")
+
+        if self._require_header_signing and not self._sign_header:
+            self._state = BindState.FAILED
+            raise ValueError("Header signing was required but was not negotiated")
+
+        if self._previous_header_signing is not None and self._previous_header_signing != self._sign_header:
+            self._state = BindState.FAILED
+            raise ValueError("Rebinding changed the negotiated header signing capability of the connection")
+
+        self._state = BindState.ESTABLISHED
+
+    def _assert_can_request(self) -> None:
+        if self._state != BindState.ESTABLISHED:
+            raise ValueError(f"Cannot send a request while the RPC connection is in the {self._state.name} state")
+
+        if self._auth and not self._auth.complete:
+            raise ValueError("Cannot send a request before authentication has completed")
+
+    def _normalize_verification_trailer(
+        self,
+        verification_trailer: VerificationTrailer,
+    ) -> VerificationTrailer:
+        bitmasks = [c for c in verification_trailer.commands if isinstance(c, CommandBitmask)]
+        if len(bitmasks) > 1:
+            raise ValueError("Verification trailer contains multiple header signing bitmask commands")
+
+        if bitmasks:
+            supported = bool(bitmasks[0].bits & CommandBitmask.CLIENT_SUPPORT_HEADER_SIGNING)
+            if supported and not self._sign_header:
+                raise ValueError("Verification trailer claims header signing support but it was not negotiated")
+            if not supported and self._sign_header:
+                raise ValueError("Verification trailer does not claim negotiated header signing support")
+
+            return verification_trailer
+
+        if not self._sign_header:
+            return verification_trailer
+
+        # When header signing was negotiated, record it in the verification
+        # trailer as the first command (matching the Windows client layout).
+        # The existing SEC_VT_COMMAND_END remains on the final command.
+        commands = list(verification_trailer.commands)
+        if not commands:
+            return VerificationTrailer(
+                commands=[
+                    CommandBitmask(
+                        flags=CommandFlags.SEC_VT_COMMAND_END,
+                        bits=CommandBitmask.CLIENT_SUPPORT_HEADER_SIGNING,
+                    )
+                ]
+            )
+
+        return VerificationTrailer(
+            commands=[
+                CommandBitmask(
+                    flags=CommandFlags.NONE,
+                    bits=CommandBitmask.CLIENT_SUPPORT_HEADER_SIGNING,
+                ),
+                *commands,
+            ]
+        )
+
+    def _verify_header_iov(self) -> None:
+        # The IOV buffer types are the proof of what was actually protected.
+        # A provider that recorded a different type than requested means the
+        # negotiated protection was not applied to the header/trailer.
+        actual = getattr(self._auth, "last_iov", None)
+        if actual is None:
+            return
+
+        expected = spnego.iov.BufferType.sign_only if self._sign_header else spnego.iov.BufferType.data_readonly
+        if actual != (expected, expected):
+            raise ValueError("Authentication provider did not apply the negotiated header protection")
 
     def _create_pdu_header(
         self,
@@ -105,8 +272,10 @@ class RpcClient:
 
         auth_len = 0
         if sec_trailer:
-            self._sign_header = True
-            flags |= PacketFlags.PFC_SUPPORT_HEADER_SIGN
+            # Only advertise a capability this client can actually apply. What
+            # was actually negotiated is tracked from the bind responses.
+            if self._auth is not None and self._auth.supports_header_signing:
+                flags |= PacketFlags.PFC_SUPPORT_HEADER_SIGN
             auth_len = len(sec_trailer.auth_value)
 
         return Bind(
@@ -153,6 +322,8 @@ class RpcClient:
         verification_trailer: t.Optional[VerificationTrailer] = None,
     ) -> tuple[Request, t.Optional[tuple[int, int]]]:
         if verification_trailer:
+            verification_trailer = self._normalize_verification_trailer(verification_trailer)
+
             # The verification trailer needs to be aligned to the next 4 byte
             # boundary.
             padding = -len(stub_data) % 4
@@ -203,6 +374,7 @@ class RpcClient:
             body = view[encrypt_offsets[0] : encrypt_offsets[1]].tobytes()
             sec_trailer = view[encrypt_offsets[1] : encrypt_offsets[1] + 8].tobytes()
             b_pdu = self._auth.wrap(header, body, sec_trailer, self._sign_header)
+            self._verify_header_iov()
 
         return b_pdu
 
@@ -210,15 +382,19 @@ class RpcClient:
         self,
         ack: t.Union[BindAck, AlterContextResponse],
         contexts: t.List[ContextElement],
+        *,
+        initial: bool,
     ) -> tuple[t.List[ContextElement], t.Optional[bytes]]:
+        if len(ack.results) < len(contexts):
+            raise ValueError("Bind response did not include a result for each requested context")
+
         alter_contexts = []
         for idx, c in enumerate(contexts):
             context_res = ack.results[idx]
             if context_res.result == ContextResultCode.ACCEPTANCE:
                 alter_contexts.append(c)
 
-        if not ack.header.packet_flags & PacketFlags.PFC_SUPPORT_HEADER_SIGN:
-            self._sign_header = False
+        self._record_negotiation(ack, initial=initial)
 
         auth_value = None
         if ack.sec_trailer:
@@ -263,8 +439,10 @@ class AsyncRpcClient(RpcClient):
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
         auth: t.Optional[AuthenticationProvider] = None,
+        *,
+        require_header_signing: bool = False,
     ) -> None:
-        super().__init__(auth)
+        super().__init__(auth, require_header_signing=require_header_signing)
         self._reader = reader
         self._writer = writer
 
@@ -286,28 +464,36 @@ class AsyncRpcClient(RpcClient):
         self,
         contexts: t.List[ContextElement],
     ) -> BindAck:
+        self._begin_bind()
+
         sec_trailer = None
         if self._auth:
             sec_trailer = await self._wrap_sync(self._auth.step)
 
         bind = self._create_bind(contexts, sec_trailer)
-        bind_ack = await self._send_pdu(bind, BindAck)
+        try:
+            bind_ack = await self._send_pdu(bind, BindAck)
 
-        if not self._auth:
+            if not self._auth:
+                self._finish_bind()
+                return bind_ack
+
+            final_contexts, in_token = self._process_bind_ack(bind_ack, contexts, initial=True)
+
+            while not self._auth.complete:
+                sec_trailer = await self._wrap_sync(self._auth.step, (in_token or b""))
+                if not sec_trailer.auth_value:
+                    break
+
+                alter_context = self._create_alter_context(final_contexts, sec_trailer)
+                alter_resp = await self._send_pdu(alter_context, AlterContextResponse)
+                _, in_token = self._process_bind_ack(alter_resp, final_contexts, initial=False)
+
+            self._finish_bind()
             return bind_ack
-
-        final_contexts, in_token = self._process_bind_ack(bind_ack, contexts)
-
-        while not self._auth.complete:
-            sec_trailer = await self._wrap_sync(self._auth.step, (in_token or b""))
-            if not sec_trailer.auth_value:
-                break
-
-            alter_context = self._create_alter_context(final_contexts, sec_trailer)
-            alter_resp = await self._send_pdu(alter_context, AlterContextResponse)
-            _, in_token = self._process_bind_ack(alter_resp, final_contexts)
-
-        return bind_ack
+        except Exception:
+            self._state = BindState.FAILED
+            raise
 
     async def request(
         self,
@@ -317,6 +503,8 @@ class AsyncRpcClient(RpcClient):
         *,
         verification_trailer: t.Optional[VerificationTrailer] = None,
     ) -> Response:
+        self._assert_can_request()
+
         req, encrypt_offsets = self._create_request(
             context_id,
             opnum,
@@ -361,8 +549,10 @@ class SyncRpcClient(RpcClient):
         self,
         sock: socket.socket,
         auth: t.Optional[AuthenticationProvider] = None,
+        *,
+        require_header_signing: bool = False,
     ) -> None:
-        super().__init__(auth)
+        super().__init__(auth, require_header_signing=require_header_signing)
         self._sock = sock
 
     def __enter__(self) -> SyncRpcClient:
@@ -383,28 +573,36 @@ class SyncRpcClient(RpcClient):
         self,
         contexts: t.List[ContextElement],
     ) -> BindAck:
+        self._begin_bind()
+
         sec_trailer = None
         if self._auth:
             sec_trailer = self._auth.step()
 
         bind = self._create_bind(contexts, sec_trailer)
-        bind_ack = self._send_pdu(bind, BindAck)
+        try:
+            bind_ack = self._send_pdu(bind, BindAck)
 
-        if not self._auth:
+            if not self._auth:
+                self._finish_bind()
+                return bind_ack
+
+            final_contexts, in_token = self._process_bind_ack(bind_ack, contexts, initial=True)
+
+            while not self._auth.complete:
+                sec_trailer = self._auth.step(in_token or b"")
+                if not sec_trailer.auth_value:
+                    break
+
+                alter_context = self._create_alter_context(final_contexts, sec_trailer)
+                alter_resp = self._send_pdu(alter_context, AlterContextResponse)
+                _, in_token = self._process_bind_ack(alter_resp, final_contexts, initial=False)
+
+            self._finish_bind()
             return bind_ack
-
-        final_contexts, in_token = self._process_bind_ack(bind_ack, contexts)
-
-        while not self._auth.complete:
-            sec_trailer = self._auth.step(in_token or b"")
-            if not sec_trailer.auth_value:
-                break
-
-            alter_context = self._create_alter_context(final_contexts, sec_trailer)
-            alter_resp = self._send_pdu(alter_context, AlterContextResponse)
-            _, in_token = self._process_bind_ack(alter_resp, final_contexts)
-
-        return bind_ack
+        except Exception:
+            self._state = BindState.FAILED
+            raise
 
     def request(
         self,
@@ -414,6 +612,8 @@ class SyncRpcClient(RpcClient):
         *,
         verification_trailer: t.Optional[VerificationTrailer] = None,
     ) -> Response:
+        self._assert_can_request()
+
         req, encrypt_offsets = self._create_request(
             context_id,
             opnum,

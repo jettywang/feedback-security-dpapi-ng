@@ -11,6 +11,10 @@ import spnego.iov
 from ._pdu import AuthenticationLevel, SecTrailer, SecurityProvider
 
 
+class HeaderSigningNotSupported(ValueError):
+    """Raised when header signing was negotiated but the provider cannot enforce it."""
+
+
 class AuthenticationProvider:
     def __init__(
         self,
@@ -33,10 +37,16 @@ class AuthenticationProvider:
             "kerberos": SecurityProvider.RPC_C_AUTHN_GSS_KERBEROS,
         }[protocol]
         self._header_length = 0
+        self.last_iov: t.Optional[tuple[spnego.iov.BufferType, spnego.iov.BufferType]] = None
 
     @property
     def complete(self) -> bool:
         return self.ctx.complete
+
+    @property
+    def supports_header_signing(self) -> bool:
+        """Whether the provider can sign the RPC header and security trailer."""
+        return bool(self.ctx.iov_available())
 
     def step(
         self,
@@ -68,7 +78,7 @@ class AuthenticationProvider:
         trailer: bytes,
         sign_header: bool,
     ) -> bytes:
-        sign_buffer_type = spnego.iov.BufferType.sign_only if sign_header else spnego.iov.BufferType.data_readonly
+        sign_buffer_type = self._header_buffer_type(sign_header)
         res = self.ctx.wrap_iov(
             [
                 (sign_buffer_type, header),
@@ -79,6 +89,8 @@ class AuthenticationProvider:
             encrypt=True,
             qop=None,
         )
+
+        self.last_iov = (sign_buffer_type, sign_buffer_type)
 
         return b"".join(
             [
@@ -97,7 +109,7 @@ class AuthenticationProvider:
         signature: bytes,
         sign_header: bool,
     ) -> bytes:
-        sign_buffer_type = spnego.iov.BufferType.sign_only if sign_header else spnego.iov.BufferType.data_readonly
+        sign_buffer_type = self._header_buffer_type(sign_header)
         res = self.ctx.unwrap_iov(
             [
                 (sign_buffer_type, header),
@@ -107,4 +119,17 @@ class AuthenticationProvider:
             ],
         )
 
+        self.last_iov = (sign_buffer_type, sign_buffer_type)
+
         return res.buffers[1].data or b""
+
+    def _header_buffer_type(
+        self,
+        sign_header: bool,
+    ) -> spnego.iov.BufferType:
+        if sign_header and not self.ctx.iov_available():
+            raise HeaderSigningNotSupported(
+                "The authentication provider does not support IOV buffers required for header signing"
+            )
+
+        return spnego.iov.BufferType.sign_only if sign_header else spnego.iov.BufferType.data_readonly
