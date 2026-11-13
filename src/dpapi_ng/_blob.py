@@ -8,7 +8,7 @@ import enum
 import typing as t
 import uuid
 
-from ._asn1 import ASN1Reader, ASN1Writer
+from ._asn1 import ASN1Reader, ASN1Writer, NotEnougData
 from ._pkcs7 import (
     AlgorithmIdentifier,
     ContentInfo,
@@ -19,6 +19,74 @@ from ._pkcs7 import (
     OtherKeyAttribute,
 )
 from ._security_descriptor import ace_to_bytes, sd_to_bytes
+
+
+class BlobParseStrategy(enum.Enum):
+    """Strategy used to locate the encrypted content in a DPAPI-NG blob.
+
+    The encrypted content of a DPAPI-NG blob can either be embedded in the
+    CMS EnvelopedData structure (the general ``NCryptProtectSecret`` form) or
+    appended after the ASN.1 envelope (the LAPS style). This controls how
+    :meth:`DPAPINGBlob.unpack` selects which bytes are the authoritative
+    encrypted content.
+
+    Args:
+        AUTO: Use the only location that contains data but fail if both
+            locations (or neither) contain data, or if a second complete CMS
+            envelope is present.
+        EMBEDDED: Only use the ``encryptedContent`` inside the EnvelopedData.
+            Any trailing data, including an empty embedded content, is a
+            failure.
+        APPENDED: Only use the bytes appended after the ASN.1 envelope. The
+            EnvelopedData must not contain an embedded ``encryptedContent``
+            and there must be trailing data.
+    """
+
+    AUTO = "auto"
+    EMBEDDED = "embedded"
+    APPENDED = "appended"
+
+
+class EncryptedContentSource(enum.Enum):
+    """The location the encrypted content was read from.
+
+    This is recorded on the unpacked :class:`DPAPINGBlob` so callers know
+    which bytes were actually decrypted. Any bytes that were ignored during
+    parsing are not authenticated and must never be treated as the protected
+    content.
+
+    Args:
+        EMBEDDED: The encrypted content came from the EnvelopedData
+            ``encryptedContent`` field.
+        APPENDED: The encrypted content came from the bytes appended after
+            the ASN.1 envelope (LAPS style).
+    """
+
+    EMBEDDED = "embedded"
+    APPENDED = "appended"
+
+
+def _is_complete_envelope(data: t.Union[bytes, bytearray, memoryview]) -> bool:
+    # Check whether the data is a whole CMS ContentInfo wrapping an
+    # EnvelopedData, i.e. a second full DPAPI-NG style envelope. Raw LAPS
+    # ciphertext is an AES-GCM value without ASN.1 framing so it never parses
+    # as one. A complete second envelope means there are two authoritative
+    # structures and the caller must not guess which one to use.
+    view = memoryview(data)
+    if not view:
+        return False
+
+    try:
+        header = ASN1Reader(view).peek_header()
+        envelope_end = header.tag_length + header.length
+        if len(view) < envelope_end:
+            return False
+
+        content_info = ContentInfo.unpack(view[:envelope_end], header=header)
+    except (NotEnougData, ValueError):
+        return False
+
+    return content_info.content_type == EnvelopedData.CONTENT_TYPE_ENVELOPED_DATA_OID
 
 
 @dataclasses.dataclass(frozen=True)
@@ -218,6 +286,9 @@ class DPAPINGBlob:
         enc_content: The encrypted content.
         enc_content_algorithm: The encrypted content algorithm OID.
         enc_content_parameters: The encrypted content parameters.
+        enc_content_source: Where the encrypted content was read from when the
+            blob was unpacked. Ignored bytes are never selected so they cannot
+            be mistaken for authenticated protected content.
     """
 
     key_identifier: KeyIdentifier
@@ -228,6 +299,7 @@ class DPAPINGBlob:
     enc_content: bytes
     enc_content_algorithm: str
     enc_content_parameters: t.Optional[bytes]
+    enc_content_source: EncryptedContentSource = EncryptedContentSource.EMBEDDED
 
     def pack(
         self,
@@ -297,11 +369,49 @@ class DPAPINGBlob:
     def unpack(
         cls,
         data: t.Union[bytes, bytearray, memoryview],
+        strategy: BlobParseStrategy = BlobParseStrategy.AUTO,
     ) -> DPAPINGBlob:
+        """Unpack the DPAPI-NG Blob.
+
+        The encrypted content can either be embedded in the CMS
+        EnvelopedData structure (the general ``NCryptProtectSecret`` form) or
+        appended after the ASN.1 envelope (the LAPS style). The ``strategy``
+        controls which location is treated as authoritative so ambiguous
+        blobs are rejected instead of silently choosing one set of bytes.
+
+        Args:
+            data: The raw DPAPI-NG blob bytes.
+            strategy: The :class:`BlobParseStrategy` used to locate the
+                encrypted content. Defaults to :attr:`BlobParseStrategy.AUTO`
+                which accepts the single valid form but rejects blobs where
+                both, or neither, location carries content.
+
+        Returns:
+            DPAPINGBlob: The unpacked blob. The ``enc_content_source`` field
+            records which bytes were selected; any bytes that were not
+            selected are never authenticated and cannot be mistaken for the
+            protected content.
+        """
+        if not isinstance(strategy, BlobParseStrategy):
+            raise ValueError(
+                f"DPAPI-NG parse strategy must be a BlobParseStrategy value but got {type(strategy).__name__}"
+            )
+
         view = memoryview(data)
-        header = ASN1Reader(view).peek_header()
-        content_info = ContentInfo.unpack(view[: header.tag_length + header.length], header=header)
-        remaining_data = view[header.tag_length + header.length :]
+        try:
+            header = ASN1Reader(view).peek_header()
+        except NotEnougData as e:
+            raise ValueError("DPAPI-NG blob is truncated and does not contain a valid ASN.1 header") from e
+
+        envelope_end = header.tag_length + header.length
+        if len(view) < envelope_end:
+            raise ValueError(
+                f"DPAPI-NG blob is truncated: ASN.1 envelope declares {header.length} bytes "
+                f"but only {len(view) - header.tag_length} are available"
+            )
+
+        content_info = ContentInfo.unpack(view[:envelope_end], header=header)
+        remaining_data = view[envelope_end:].tobytes()
 
         if content_info.content_type != EnvelopedData.CONTENT_TYPE_ENVELOPED_DATA_OID:
             raise ValueError(f"DPAPI-NG blob content type '{content_info.content_type}' is unsupported")
@@ -323,9 +433,70 @@ class DPAPINGBlob:
 
         protection_descriptor = ProtectionDescriptor.unpack(kek_info.kekid.other.key_attr or b"")
 
-        # Some DPAPI blobs don't include the content in the PKCS7 payload but
-        # just append after the blob.
-        enc_content = enveloped_data.encrypted_content_info.content or remaining_data.tobytes()
+        # The encrypted content is either embedded in the PKCS7 payload or
+        # appended after the envelope (LAPS style). Resolve which bytes are
+        # authoritative according to the requested strategy rather than
+        # silently preferring one location when both are present.
+        embedded_content = enveloped_data.encrypted_content_info.content
+        has_embedded = bool(embedded_content)
+        has_appended = bool(remaining_data)
+        second_envelope = _is_complete_envelope(remaining_data)
+
+        enc_content: bytes
+        enc_content_source: EncryptedContentSource
+
+        if second_envelope:
+            raise ValueError(
+                "DPAPI-NG blob contains a second complete CMS EnvelopedData after the first "
+                "envelope and it is ambiguous which one is authoritative"
+            )
+
+        if strategy == BlobParseStrategy.EMBEDDED:
+            if not has_embedded:
+                raise ValueError(
+                    "DPAPI-NG blob parse strategy 'embedded' requires encryptedContent in the "
+                    "EnvelopedData but none was present"
+                )
+            if has_appended:
+                raise ValueError(
+                    "DPAPI-NG blob parse strategy 'embedded' found unexpected trailing data after "
+                    "the ASN.1 envelope"
+                )
+            enc_content = t.cast(bytes, embedded_content)
+            enc_content_source = EncryptedContentSource.EMBEDDED
+
+        elif strategy == BlobParseStrategy.APPENDED:
+            if has_embedded:
+                raise ValueError(
+                    "DPAPI-NG blob parse strategy 'appended' found encryptedContent embedded in the "
+                    "EnvelopedData as well as trailing data"
+                )
+            if not has_appended:
+                raise ValueError(
+                    "DPAPI-NG blob parse strategy 'appended' requires encrypted content appended "
+                    "after the ASN.1 envelope but none was present"
+                )
+            enc_content = remaining_data
+            enc_content_source = EncryptedContentSource.APPENDED
+
+        else:
+            if has_embedded and has_appended:
+                raise ValueError(
+                    "DPAPI-NG blob contains encrypted content both in the EnvelopedData and appended "
+                    "after the ASN.1 envelope and it is ambiguous which one is authoritative"
+                )
+            if not has_embedded and not has_appended:
+                raise ValueError(
+                    "DPAPI-NG blob contains no encrypted content in either the EnvelopedData or "
+                    "after the ASN.1 envelope"
+                )
+
+            if has_embedded:
+                enc_content = t.cast(bytes, embedded_content)
+                enc_content_source = EncryptedContentSource.EMBEDDED
+            else:
+                enc_content = remaining_data
+                enc_content_source = EncryptedContentSource.APPENDED
 
         return DPAPINGBlob(
             key_identifier=key_identifier,
@@ -336,4 +507,5 @@ class DPAPINGBlob:
             enc_content=enc_content,
             enc_content_algorithm=enveloped_data.encrypted_content_info.algorithm.algorithm,
             enc_content_parameters=enveloped_data.encrypted_content_info.algorithm.parameters,
+            enc_content_source=enc_content_source,
         )

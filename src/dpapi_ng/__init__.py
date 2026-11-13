@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from ._blob import BlobParseStrategy, EncryptedContentSource
 from ._client import (
     KeyCache,
     async_ncrypt_protect_secret,
@@ -12,6 +13,8 @@ from ._client import (
 )
 
 __all__ = [
+    "BlobParseStrategy",
+    "EncryptedContentSource",
     "KeyCache",
     "async_ncrypt_protect_secret",
     "async_ncrypt_unprotect_secret",

@@ -8,7 +8,7 @@ import typing as t
 import uuid
 
 from ._asn1 import ASN1Writer
-from ._blob import DPAPINGBlob, ProtectionDescriptor
+from ._blob import BlobParseStrategy, DPAPINGBlob, ProtectionDescriptor
 from ._crypto import (
     AlgorithmOID,
     cek_decrypt,
@@ -549,6 +549,7 @@ def ncrypt_unprotect_secret(
     password: t.Optional[str] = None,
     auth_protocol: str = "negotiate",
     cache: t.Optional[KeyCache] = None,
+    parse_strategy: BlobParseStrategy = BlobParseStrategy.AUTO,
 ) -> bytes:
     """Decrypt DPAPI-NG Blob.
 
@@ -576,6 +577,10 @@ def ncrypt_unprotect_secret(
             ``negotiate`` but can be ``kerberos`` or ``ntlm``.
         cache: Optional cache that is used as the key source to avoid making
             the RPC call.
+        parse_strategy: The :class:`BlobParseStrategy` used to locate the
+            encrypted content. Defaults to :attr:`BlobParseStrategy.AUTO`
+            which rejects blobs where the content location is ambiguous
+            before any decryption is attempted.
 
     Returns:
         bytes: The decrypt DPAPI-NG data.
@@ -588,7 +593,7 @@ def ncrypt_unprotect_secret(
     _NCryptUnprotectSecret:
         https://learn.microsoft.com/en-us/windows/win32/api/ncryptprotect/nf-ncryptprotect-ncryptunprotectsecret
     """
-    blob = DPAPINGBlob.unpack(data)
+    blob = DPAPINGBlob.unpack(data, strategy=parse_strategy)
     target_sd = blob.protection_descriptor.get_target_sd()
 
     cache = cache or KeyCache()
@@ -720,6 +725,7 @@ async def async_ncrypt_unprotect_secret(
     password: t.Optional[str] = None,
     auth_protocol: str = "negotiate",
     cache: t.Optional[KeyCache] = None,
+    parse_strategy: BlobParseStrategy = BlobParseStrategy.AUTO,
 ) -> bytes:
     """Decrypt DPAPI-NG Blob.
 
@@ -747,6 +753,10 @@ async def async_ncrypt_unprotect_secret(
             ``negotiate`` but can be ``kerberos`` or ``ntlm``.
         cache: Optional cache that is used as the key source to avoid making
             the RPC call.
+        parse_strategy: The :class:`BlobParseStrategy` used to locate the
+            encrypted content. Defaults to :attr:`BlobParseStrategy.AUTO`
+            which rejects blobs where the content location is ambiguous
+            before any decryption is attempted.
 
     Returns:
         bytes: The decrypt DPAPI-NG data.
@@ -759,7 +769,7 @@ async def async_ncrypt_unprotect_secret(
     _NCryptUnprotectSecret:
         https://learn.microsoft.com/en-us/windows/win32/api/ncryptprotect/nf-ncryptprotect-ncryptunprotectsecret
     """
-    blob = DPAPINGBlob.unpack(data)
+    blob = DPAPINGBlob.unpack(data, strategy=parse_strategy)
     target_sd = blob.protection_descriptor.get_target_sd()
 
     cache = cache or KeyCache()

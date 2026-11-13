@@ -108,6 +108,10 @@ The following kwargs can be used for `ncrypt_unprotect_secret`, `async_ncrypt_un
 * `auth_protocol`: The authentication protocol (`negotiate`, `kerberos`, `ntlm`) to use for the RPC connection
 * `cache`: A cache to store keys retrieved for future operation
 
+In addition to that, `ncrypt_unprotect_secret` and `async_ncrypt_unprotect_secret` take the following additional kwarg.
+
+* `parse_strategy`: A `dpapi_ng.BlobParseStrategy` value controlling where the encrypted content is read from. The default `AUTO` uses the single location that carries content but rejects blobs where the content is present both inside the CMS EnvelopedData and appended after the envelope (LAPS style), where no content is present at all, or where a second complete envelope is appended. Use `EMBEDDED` or `APPENDED` to require one specific form. The `enc_content_source` attribute on the unpacked blob records which bytes were actually decrypted so ignored trailing data is never mistaken for authenticated content.
+
 In addition to that, `ncrypt_protect_secret` and `async_ncrypt_protect_secret` take the following additional kwarg.
 
 * `domain_name`: The name of the domain/forest to use when looking up the RPC target to use when retrieving the key info

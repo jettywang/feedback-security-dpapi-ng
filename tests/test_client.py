@@ -15,6 +15,8 @@ from cryptography.hazmat.primitives.asymmetric import ec
 import dpapi_ng
 import dpapi_ng._client as client
 import dpapi_ng._gkdi as gkdi
+from dpapi_ng._asn1 import ASN1Reader
+from dpapi_ng._blob import BlobParseStrategy, DPAPINGBlob, EncryptedContentSource
 
 from .conftest import get_test_data
 
@@ -270,3 +272,132 @@ async def test_async_unprotect_secret(
 
     actual = await dpapi_ng.async_ncrypt_unprotect_secret(data, cache=key_cache)
     assert actual == expected
+
+
+def _load_nonce_cache() -> tuple[str, dpapi_ng.KeyCache]:
+    scenario = "kdf_sha256_nonce"
+    _, cache = _load_root_key(scenario)
+    root_key_identifier = list(cache._root_keys.keys())[0]
+    return str(root_key_identifier), cache
+
+
+def test_unprotect_secret_both_forms_same_plaintext() -> None:
+    plaintext = b"dual-form-secret"
+    descriptor = "S-1-5-21-2185496602-3367037166-1388177638-1103"
+    root_key_id, cache = _load_nonce_cache()
+
+    embedded_blob = dpapi_ng.ncrypt_protect_secret(
+        plaintext,
+        descriptor,
+        root_key_identifier=uuid.UUID(root_key_id),
+        cache=cache,
+    )
+
+    # Rebuild the exact same protected content in the LAPS (appended) form.
+    parsed = DPAPINGBlob.unpack(embedded_blob)
+    assert parsed.enc_content_source == EncryptedContentSource.EMBEDDED
+    appended_blob = parsed.pack(blob_in_envelope=False)
+    assert DPAPINGBlob.unpack(appended_blob).enc_content_source == EncryptedContentSource.APPENDED
+
+    # Both legal forms return the same plaintext through the public entry.
+    assert dpapi_ng.ncrypt_unprotect_secret(embedded_blob, cache=cache) == plaintext
+    assert dpapi_ng.ncrypt_unprotect_secret(appended_blob, cache=cache) == plaintext
+
+    # Explicit strategies also succeed for their matching form.
+    assert (
+        dpapi_ng.ncrypt_unprotect_secret(
+            appended_blob,
+            cache=cache,
+            parse_strategy=BlobParseStrategy.APPENDED,
+        )
+        == plaintext
+    )
+    assert (
+        dpapi_ng.ncrypt_unprotect_secret(
+            embedded_blob,
+            cache=cache,
+            parse_strategy=BlobParseStrategy.EMBEDDED,
+        )
+        == plaintext
+    )
+
+
+@pytest.mark.asyncio
+async def test_async_unprotect_secret_both_forms_same_plaintext() -> None:
+    plaintext = b"dual-form-secret-async"
+    descriptor = "S-1-5-21-2185496602-3367037166-1388177638-1103"
+    root_key_id, cache = _load_nonce_cache()
+
+    embedded_blob = await dpapi_ng.async_ncrypt_protect_secret(
+        plaintext,
+        descriptor,
+        root_key_identifier=uuid.UUID(root_key_id),
+        cache=cache,
+    )
+    appended_blob = DPAPINGBlob.unpack(embedded_blob).pack(blob_in_envelope=False)
+
+    assert await dpapi_ng.async_ncrypt_unprotect_secret(embedded_blob, cache=cache) == plaintext
+    assert await dpapi_ng.async_ncrypt_unprotect_secret(appended_blob, cache=cache) == plaintext
+
+
+def test_unprotect_secret_dual_conflict_rejected_before_decryption(monkeypatch: pytest.MonkeyPatch) -> None:
+    plaintext = b"ambiguous-secret"
+    descriptor = "S-1-5-21-2185496602-3367037166-1388177638-1103"
+    root_key_id, cache = _load_nonce_cache()
+
+    embedded_blob = dpapi_ng.ncrypt_protect_secret(
+        plaintext,
+        descriptor,
+        root_key_identifier=uuid.UUID(root_key_id),
+        cache=cache,
+    )
+    embedded_content = DPAPINGBlob.unpack(embedded_blob).enc_content
+
+    # Both locations carry content at once.
+    conflict_blob = embedded_blob + embedded_content
+
+    def fail_decrypt(*args: t.Any, **kwargs: t.Any) -> bytes:
+        raise AssertionError("decryption must not be attempted for an ambiguous blob")
+
+    monkeypatch.setattr(client, "_decrypt_blob", fail_decrypt)
+
+    for strategy in BlobParseStrategy:
+        with pytest.raises(ValueError, match="ambiguous|unexpected trailing|as well as"):
+            dpapi_ng.ncrypt_unprotect_secret(
+                conflict_blob,
+                cache=cache,
+                parse_strategy=strategy,
+            )
+
+
+def test_unprotect_secret_second_envelope_rejected_before_decryption(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plaintext = b"two-envelopes"
+    descriptor = "S-1-5-21-2185496602-3367037166-1388177638-1103"
+    root_key_id, cache = _load_nonce_cache()
+
+    embedded_blob = dpapi_ng.ncrypt_protect_secret(
+        plaintext,
+        descriptor,
+        root_key_identifier=uuid.UUID(root_key_id),
+        cache=cache,
+    )
+    # An empty LAPS envelope followed by a full embedded envelope.
+    empty_envelope = DPAPINGBlob.unpack(embedded_blob).pack(blob_in_envelope=False)
+    header = ASN1Reader(empty_envelope).peek_header()
+    empty_envelope = empty_envelope[: header.tag_length + header.length]
+    two_envelopes = empty_envelope + embedded_blob
+
+    def fail_decrypt(*args: t.Any, **kwargs: t.Any) -> bytes:
+        raise AssertionError("decryption must not be attempted when a second envelope is present")
+
+    monkeypatch.setattr(client, "_decrypt_blob", fail_decrypt)
+
+    for strategy in BlobParseStrategy:
+        with pytest.raises(ValueError, match="second complete CMS EnvelopedData"):
+            dpapi_ng.ncrypt_unprotect_secret(
+                two_envelopes,
+                cache=cache,
+                parse_strategy=strategy,
+            )
