@@ -18,7 +18,14 @@ from ._crypto import (
     content_encrypt,
 )
 from ._dns import async_lookup_dc, lookup_dc
-from ._epm import EPM, EptMap, EptMapResult, TCPFloor, build_tcpip_tower
+from ._epm import (
+    EPM,
+    EpmEndpointError,
+    EptMap,
+    EptMapResult,
+    build_tcpip_tower,
+    select_tcp_endpoint,
+)
 from ._gkdi import (
     ISD_KEY,
     FFCDHParameters,
@@ -109,16 +116,23 @@ def _process_bind_result(
 def _process_ept_map_result(
     response: Response,
 ) -> int:
-    map_response = EptMapResult.unpack(response.stub_data)
+    try:
+        map_response = EptMapResult.unpack(response.stub_data)
+    except (IndexError, ValueError) as e:
+        raise EpmEndpointError("rejected_mapping") from e
+
     if map_response.status != 0:
         raise ValueError(f"Receive error during ept_map call 0x{map_response.status:08X}")
 
-    for tower in map_response.towers:
-        for floor in tower:
-            if isinstance(floor, TCPFloor):
-                return floor.port
-
-    raise ValueError("Did not find expected TCP Port in ept_map response")
+    endpoint = select_tcp_endpoint(
+        map_response.towers,
+        interface=ISD_KEY,
+        # This must match the transfer syntax that the subsequent bind
+        # requests. Accepting a tower for a syntax that is not used later
+        # would select an endpoint that cannot actually serve the request.
+        transfer_syntaxes=[NDR64],
+    )
+    return endpoint.port
 
 
 def _process_get_key_result(
@@ -152,6 +166,9 @@ async def _async_get_key(
         resp = await rpc.request(context_id, ept_map.opnum, ept_map.pack())
         isd_key_port = _process_ept_map_result(resp)
 
+    # The host is the caller supplied server. Only the port from the EPM
+    # response is used so the response cannot redirect authentication to a
+    # different address.
     rpc = await async_create_rpc_connection(
         server,
         isd_key_port,
@@ -194,6 +211,9 @@ def _sync_get_key(
         resp = rpc.request(0, ept_map.opnum, ept_map.pack())
         isd_key_port = _process_ept_map_result(resp)
 
+    # The host is the caller supplied server. Only the port from the EPM
+    # response is used so the response cannot redirect authentication to a
+    # different address.
     with create_rpc_connection(
         server,
         isd_key_port,

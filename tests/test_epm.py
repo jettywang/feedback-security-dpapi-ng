@@ -5,8 +5,15 @@ from __future__ import annotations
 
 import uuid
 
+import pytest
+
 import dpapi_ng._rpc as rpc
 from dpapi_ng import _epm as epm
+
+SERVICE = rpc.SyntaxId(uuid.UUID("b9785960-524f-11df-8b6d-83dcded72085"), 1, 0)
+DATA_REP = rpc.SyntaxId(uuid.UUID("8a885d04-1ceb-11c9-9fe8-08002b104860"), 2, 0)
+NDR64 = rpc.SyntaxId(uuid.UUID("71710533-beba-4937-8319-b5dbef9ccc36"), 1, 0)
+OTHER_INTERFACE = rpc.SyntaxId(uuid.UUID("11223344-5566-7788-99aa-bbccddeeff00"), 1, 0)
 
 
 def test_ept_map_pack() -> None:
@@ -344,3 +351,213 @@ def test_unpack_unknown_floor() -> None:
     assert msg.protocol == epm.FloorProtocol(0xFF)
     assert msg.lhs == b"\x00"
     assert msg.rhs == b"\x00"
+
+
+def _make_response(stub_data: bytes) -> rpc.Response:
+    return rpc.Response(
+        header=rpc.PDUHeader(
+            version=5,
+            version_minor=0,
+            packet_type=rpc.PacketType.RESPONSE,
+            packet_flags=rpc.PacketFlags.PFC_FIRST_FRAG | rpc.PacketFlags.PFC_LAST_FRAG,
+            data_rep=rpc.DataRep(),
+            frag_len=8 + len(stub_data),
+            auth_len=0,
+            call_id=2,
+        ),
+        sec_trailer=None,
+        alloc_hint=len(stub_data),
+        context_id=0,
+        cancel_count=0,
+        stub_data=stub_data,
+    )
+
+
+def _map_result_response(towers: t.List[t.List[epm.Floor]]) -> rpc.Response:
+    return _make_response(epm.EptMapResult(entry_handle=None, towers=towers, status=0).pack())
+
+
+def _roundtrip(towers: t.List[t.List[epm.Floor]]) -> t.List[t.List[epm.Floor]]:
+    # Push the towers through the same wire format used by a real response so
+    # the decoded floors carry their raw lhs/rhs payloads.
+    packed = epm.EptMapResult(entry_handle=None, towers=towers, status=0)
+    return epm.EptMapResult.unpack(packed.pack()).towers
+
+
+def _valid_tower(
+    port: int,
+    interface: rpc.SyntaxId = SERVICE,
+    transfer: rpc.SyntaxId = NDR64,
+) -> t.List[epm.Floor]:
+    return epm.build_tcpip_tower(interface, transfer, port, 0)
+
+
+def test_select_tcp_endpoint_order_independent() -> None:
+    wrong_interface = _valid_tower(5001, OTHER_INTERFACE)
+    wrong_syntax = _valid_tower(5002, SERVICE, DATA_REP)
+    valid = _valid_tower(5003)
+
+    orders = [
+        [wrong_interface, wrong_syntax, valid],
+        [valid, wrong_syntax, wrong_interface],
+        [wrong_syntax, valid, wrong_interface],
+        [valid, wrong_interface, wrong_syntax],
+    ]
+
+    for towers in orders:
+        endpoint = epm.select_tcp_endpoint(towers, SERVICE, [NDR64])
+        assert endpoint.port == 5003
+
+
+def test_select_tcp_endpoint_prefers_transfer_syntax() -> None:
+    endpoint = epm.select_tcp_endpoint(
+        [_valid_tower(5001, SERVICE, DATA_REP), _valid_tower(5002, SERVICE, NDR64)],
+        SERVICE,
+        [NDR64],
+    )
+    assert endpoint.port == 5002
+
+
+@pytest.mark.parametrize(
+    "mutate, reason",
+    [
+        (lambda tower: [epm.UUIDFloor(OTHER_INTERFACE.uuid, 1, 0), *tower[1:]], "interface_mismatch"),
+        (
+            lambda tower: [tower[0], epm.UUIDFloor(OTHER_INTERFACE.uuid, 1, 0), *tower[2:]],
+            "transfer_syntax_mismatch",
+        ),
+        (
+            lambda tower: [tower[0], tower[1], tower[3], tower[2], *tower[4:]],
+            "unexpected_tcp_floor_where_rpc_connection_oriented_expected",
+        ),
+        (
+            lambda tower: [tower[0], tower[2], tower[1], tower[3], *tower[4:]],
+            "unexpected_rpc_connection_oriented_floor_where_transfer_syntax_uuid_expected",
+        ),
+        (
+            lambda tower: [epm.Floor(epm.FloorProtocol(0xFE), b"", b""), *tower[1:]],
+            "unknown_floor_0xFE",
+        ),
+        (
+            lambda tower: [tower[0], epm.Floor(epm.FloorProtocol(0xFE), b"", b""), tower[2], tower[3], tower[4]],
+            "unknown_floor_0xFE",
+        ),
+        (
+            lambda tower: [tower[0], tower[1], tower[2]],
+            "invalid_floor_count",
+        ),
+        (
+            lambda tower: [*tower[:4], epm.Floor(epm.FloorProtocol.UDP, b"", b"\x00\x00")],
+            "unexpected_udp_floor_where_ip_expected",
+        ),
+        (
+            lambda tower: [tower[0], tower[1], tower[2], tower[3], tower[4], tower[4]],
+            "invalid_floor_count",
+        ),
+        (
+            lambda tower: [tower[0], tower[1], tower[2], tower[3], epm.TCPFloor(5003)],
+            "unexpected_tcp_floor_where_ip_expected",
+        ),
+        (
+            lambda tower: [epm.RPCConnectionOrientedFloor(0), *tower[1:]],
+            "unexpected_rpc_connection_oriented_floor_where_interface_uuid_expected",
+        ),
+    ],
+)
+def test_select_tcp_endpoint_rejects_tower(
+    mutate: t.Callable[[t.List[epm.Floor]], t.List[epm.Floor]],
+    reason: str,
+) -> None:
+    tower = mutate(_valid_tower(5003))
+
+    with pytest.raises(epm.EpmEndpointError) as ctx:
+        epm.select_tcp_endpoint([tower], SERVICE, [NDR64])
+
+    assert ctx.value.reason == "no_matching_tower"
+    assert ctx.value.tower_rejections == ((0, reason),)
+
+
+def test_select_tcp_endpoint_rejects_truncated_port() -> None:
+    tower = _valid_tower(5003)
+    truncated = epm.Floor(epm.FloorProtocol.TCP, b"", b"\x01")
+    bad = _roundtrip([[*tower[:3], truncated, tower[4]]])[0]
+
+    # The decoded tower still claims protocol TCP but its rhs is one byte.
+    assert len(bad[3].rhs) == 1
+
+    with pytest.raises(epm.EpmEndpointError) as ctx:
+        epm.select_tcp_endpoint([bad], SERVICE, [NDR64])
+
+    assert ctx.value.reason == "no_matching_tower"
+    assert ctx.value.tower_rejections == ((0, "truncated_port"),)
+
+
+def test_select_tcp_endpoint_rejects_truncated_uuid_payload() -> None:
+    tower = _valid_tower(5003)
+    truncated_interface = epm.UUIDFloor(SERVICE.uuid, SERVICE.version, SERVICE.version_minor)
+    object.__setattr__(truncated_interface, "lhs", b"\x00" * 10)
+    bad = [truncated_interface, *tower[1:]]
+
+    with pytest.raises(epm.EpmEndpointError) as ctx:
+        epm.select_tcp_endpoint([bad], SERVICE, [NDR64])
+
+    assert ctx.value.tower_rejections == ((0, "truncated_floor_payload"),)
+
+
+def test_select_tcp_endpoint_rejects_invalid_port() -> None:
+    tower = _valid_tower(5003)
+
+    for port in (0, 0x10000, -1):
+        with pytest.raises(epm.EpmEndpointError) as ctx:
+            epm.select_tcp_endpoint([[*tower[:3], epm.TCPFloor(port), tower[4]]], SERVICE, [NDR64])
+
+        assert ctx.value.tower_rejections == ((0, "invalid_port"),)
+
+
+def test_select_tcp_endpoint_all_invalid() -> None:
+    wrong_interface = _valid_tower(5001, OTHER_INTERFACE)
+    unknown_floor = [
+        *_valid_tower(5002)[:2],
+        epm.Floor(epm.FloorProtocol(0xFD), b"", b""),
+        *_valid_tower(5002)[3:],
+    ]
+
+    with pytest.raises(epm.EpmEndpointError) as ctx:
+        epm.select_tcp_endpoint([wrong_interface, unknown_floor], SERVICE, [NDR64])
+
+    assert ctx.value.reason == "no_matching_tower"
+    assert ctx.value.tower_rejections == ((0, "interface_mismatch"), (1, "unknown_floor_0xFD"))
+
+
+def test_select_tcp_endpoint_error_is_publicable() -> None:
+    error = epm.EpmEndpointError("no_matching_tower", [(0, "interface_mismatch")])
+
+    assert "no_matching_tower" in str(error)
+    assert "interface_mismatch" in str(error)
+    assert "10." not in str(error)
+    assert "dc.example.com" not in str(error)
+
+    # The endpoint carries only the port and syntax, never the IP floor value.
+    endpoint = epm.TcpEndpoint(port=5003, transfer_syntax=NDR64)
+    assert not hasattr(endpoint, "addr")
+
+
+def test_client_process_ept_map_result_uses_selection() -> None:
+    import dpapi_ng._client as client
+
+    wrong = _roundtrip([_valid_tower(5001, OTHER_INTERFACE)])[0]
+    valid = _roundtrip([_valid_tower(5003)])[0]
+
+    response = _map_result_response([wrong, valid])
+    assert client._process_ept_map_result(response) == 5003
+
+
+def test_client_process_ept_map_result_all_invalid() -> None:
+    import dpapi_ng._client as client
+
+    wrong = _roundtrip([_valid_tower(5001, OTHER_INTERFACE)])[0]
+
+    with pytest.raises(epm.EpmEndpointError) as ctx:
+        client._process_ept_map_result(_map_result_response([wrong]))
+
+    assert ctx.value.reason == "no_matching_tower"
