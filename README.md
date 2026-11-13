@@ -107,11 +107,45 @@ The following kwargs can be used for `ncrypt_unprotect_secret`, `async_ncrypt_un
 * `password`: The password to authenticate with for the RPC connection
 * `auth_protocol`: The authentication protocol (`negotiate`, `kerberos`, `ntlm`) to use for the RPC connection
 * `cache`: A cache to store keys retrieved for future operation
+* `key_provider`: A read-only key provider used before the cache and RPC sources
 
 In addition to that, `ncrypt_protect_secret` and `async_ncrypt_protect_secret` take the following additional kwarg.
 
 * `domain_name`: The name of the domain/forest to use when looking up the RPC target to use when retrieving the key info
 * `root_key_identifier`: The root key identifier UUID, necessary in order to make the cache work for these functions
+
+### Custom Key Provider
+
+A `key_provider` can be passed to the sync and async protect and unprotect functions to supply the GKDI group key envelope from an offline source.
+The provider must implement `get_key` or `async_get_key` with the following signature:
+
+```python
+import typing as t
+import uuid
+
+import dpapi_ng
+
+
+class MyProvider(dpapi_ng.KeyProvider):
+    def get_key(
+        self,
+        target_sd: bytes,
+        root_key_identifier: t.Optional[uuid.UUID],
+        l0: int,
+        l1: int,
+        l2: int,
+    ) -> t.Optional[dpapi_ng.GroupKeyEnvelope]:
+        return None
+
+
+dpapi_ng.ncrypt_protect_secret(b"...", "S-1-5-21-...", key_provider=MyProvider())
+```
+
+A provider that defines `get_key` can be used by both the sync and async functions, while `async_get_key` is used by the async functions when present.
+The provider is consulted before the `cache` and any RPC call.
+For a protect operation the key hierarchy time slot (`l0`, `l1`, `l2`) is sampled once at the start of the call and reused for the whole operation, even if the provider returns after a time slot boundary has passed.
+The provider must return a private `GroupKeyEnvelope` at, or above, the requested index; a seed returned at a higher index is derived to the requested values.
+A public envelope, a seed that cannot derive the requested values, or a mismatched root key id is rejected with a `ValueError`.
 
 It is also possible to encrypt and decrypt the DPAPI-NG blob by providing the root key stored in the domain.
 This can either be retrieved using an offline attack or through an LDAP query if running as a Domain Admin user.

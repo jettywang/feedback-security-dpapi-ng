@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import dataclasses
 import json
 import os
 import typing as t
@@ -270,3 +272,297 @@ async def test_async_unprotect_secret(
 
     actual = await dpapi_ng.async_ncrypt_unprotect_secret(data, cache=key_cache)
     assert actual == expected
+
+
+FIXED_TIME = 179456765400000000
+
+
+def _fixed_time() -> int:
+    return client._get_key_indices(FIXED_TIME)
+
+
+def _set_fixed_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    indices = _fixed_time()
+    monkeypatch.setattr(
+        client,
+        "_get_current_time",
+        lambda: indices.l0 * client._L0_TIME_SLOT + indices.l1 * client._L1_TIME_SLOT + indices.l2 * client._TIME_SLOT,
+    )
+
+
+class _LocalProvider(dpapi_ng.KeyProvider):
+    """A local provider backed by an offline root key cache."""
+
+    def __init__(self, cache: dpapi_ng.KeyCache, seed_at_l1: int = -1, seed_at_l2: int = -1) -> None:
+        self.cache = cache
+        self.calls: t.List[tuple[int, int, int]] = []
+        self.seed_at_l1 = seed_at_l1
+        self.seed_at_l2 = seed_at_l2
+
+    def get_key(
+        self,
+        target_sd: bytes,
+        root_key_identifier: t.Optional[uuid.UUID],
+        l0: int,
+        l1: int,
+        l2: int,
+    ) -> gkdi.GroupKeyEnvelope:
+        assert root_key_identifier
+        self.calls.append((l0, l1, l2))
+        return self.cache._get_key(
+            target_sd,
+            root_key_identifier,
+            l0,
+            self.seed_at_l1 if self.seed_at_l1 >= 0 else l1,
+            self.seed_at_l2 if self.seed_at_l2 >= 0 else l2,
+        )
+
+
+class _AsyncProvider(_LocalProvider):
+    async def async_get_key(
+        self,
+        target_sd: bytes,
+        root_key_identifier: t.Optional[uuid.UUID],
+        l0: int,
+        l1: int,
+        l2: int,
+    ) -> gkdi.GroupKeyEnvelope:
+        return self.get_key(target_sd, root_key_identifier, l0, l1, l2)
+
+
+def _assert_blob_round_trip(
+    blob: bytes,
+    provider: dpapi_ng.KeyProvider,
+    expected: bytes,
+) -> None:
+    unpacked = client.DPAPINGBlob.unpack(blob)
+    assert dpapi_ng.ncrypt_unprotect_secret(blob, key_provider=provider) == expected
+    assert unpacked.key_identifier.l0 == _fixed_time().l0
+
+
+def test_protect_sync_and_async_provider_same_structure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    test_data = b"same-key-source"
+    test_protection_descriptor = "S-1-5-21-2185496602-3367037166-1388177638-1103"
+    _set_fixed_time(monkeypatch)
+
+    cache = _load_root_key("kdf_sha512_nonce")[1]
+    root_key_id = list(cache._root_keys.keys())[0]
+    sync_provider = _LocalProvider(cache)
+
+    sync_blob = dpapi_ng.ncrypt_protect_secret(
+        test_data,
+        test_protection_descriptor,
+        root_key_identifier=root_key_id,
+        key_provider=sync_provider,
+    )
+
+    async_provider = _AsyncProvider(cache)
+    async_blob = asyncio.run(
+        dpapi_ng.async_ncrypt_protect_secret(
+            test_data,
+            test_protection_descriptor,
+            root_key_identifier=root_key_id,
+            key_provider=async_provider,
+        )
+    )
+
+    sync_unpacked = client.DPAPINGBlob.unpack(sync_blob)
+    async_unpacked = client.DPAPINGBlob.unpack(async_blob)
+
+    indices = _fixed_time()
+    assert sync_provider.calls == async_provider.calls == [(indices.l0, indices.l1, indices.l2)]
+    assert (
+        sync_unpacked.key_identifier.l0,
+        sync_unpacked.key_identifier.l1,
+        sync_unpacked.key_identifier.l2,
+    ) == (
+        async_unpacked.key_identifier.l0,
+        async_unpacked.key_identifier.l1,
+        async_unpacked.key_identifier.l2,
+    ) == (indices.l0, indices.l1, indices.l2)
+    assert sync_unpacked.key_identifier.root_key_identifier == root_key_id
+    assert async_unpacked.key_identifier.root_key_identifier == root_key_id
+    assert sync_unpacked.protection_descriptor == async_unpacked.protection_descriptor
+
+    # The CEK is randomly generated so the blobs differ, but both must
+    # decrypt with the same offline provider.
+    _assert_blob_round_trip(sync_blob, sync_provider, test_data)
+    _assert_blob_round_trip(async_blob, async_provider, test_data)
+
+
+def test_protect_async_provider_crosses_time_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    test_data = b"boundary"
+    test_protection_descriptor = "S-1-5-21-2185496602-3367037166-1388177638-1103"
+    _set_fixed_time(monkeypatch)
+    indices = _fixed_time()
+
+    cache = _load_root_key("kdf_sha256_nonce")[1]
+    root_key_id = list(cache._root_keys.keys())[0]
+    provider = _LocalProvider(cache)
+
+    class _CrossingProvider(dpapi_ng.KeyProvider):
+        async def async_get_key(
+            self,
+            target_sd: bytes,
+            root_key_identifier: t.Optional[uuid.UUID],
+            l0: int,
+            l1: int,
+            l2: int,
+        ) -> gkdi.GroupKeyEnvelope:
+            gke = provider.get_key(target_sd, root_key_identifier, l0, l1, l2)
+            # Move the clock past the boundary while the provider was
+            # waiting. The protect operation must not resample.
+            monkeypatch.setattr(
+                client,
+                "_get_current_time",
+                lambda: (indices.l2 + 1) * client._TIME_SLOT
+                + indices.l1 * client._L1_TIME_SLOT
+                + indices.l0 * client._L0_TIME_SLOT,
+            )
+            return gke
+
+    crossing = _CrossingProvider()
+    blob = asyncio.run(
+        dpapi_ng.async_ncrypt_protect_secret(
+            test_data,
+            test_protection_descriptor,
+            root_key_identifier=root_key_id,
+            key_provider=crossing,
+        )
+    )
+
+    unpacked = client.DPAPINGBlob.unpack(blob)
+    assert (unpacked.key_identifier.l0, unpacked.key_identifier.l1, unpacked.key_identifier.l2) == (
+        indices.l0,
+        indices.l1,
+        indices.l2,
+    )
+    assert provider.calls == [(indices.l0, indices.l1, indices.l2)]
+
+    # Verify the key identifier refers to the material actually used. The
+    # KEK derived from the envelope at those indices must match an
+    # independent derivation from the raw seed at the higher index.
+    raw_gke = cache._get_key(
+        unpacked.protection_descriptor.get_target_sd(),
+        root_key_id,
+        indices.l0,
+        31,
+        31,
+    )
+    assert raw_gke
+    kdf_parameters = gkdi.KDFParameters.unpack(raw_gke.kdf_parameters)
+    _, l2_key = gkdi.compute_l1_l2_key(
+        kdf_parameters.hash_algorithm,
+        indices.l1,
+        indices.l2,
+        raw_gke,
+    )
+    current_gke = cache._get_key(
+        unpacked.protection_descriptor.get_target_sd(),
+        root_key_id,
+        indices.l0,
+        indices.l1,
+        indices.l2,
+    )
+    assert current_gke
+    expected_kek = gkdi.kdf(
+        kdf_parameters.hash_algorithm,
+        l2_key,
+        gkdi.KDS_SERVICE_LABEL,
+        unpacked.key_identifier.key_info,
+        32,
+    )
+    assert current_gke.get_kek(unpacked.key_identifier) == expected_kek
+    assert dpapi_ng.ncrypt_unprotect_secret(blob, key_provider=provider) == test_data
+
+
+@pytest.mark.parametrize(
+    "public",
+    [True, False],
+)
+def test_protect_provider_rejects_unusable_envelope(
+    public: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    test_protection_descriptor = "S-1-5-21-2185496602-3367037166-1388177638-1103"
+    _set_fixed_time(monkeypatch)
+
+    cache = _load_root_key("kdf_sha512_nonce")[1]
+    root_key_id = list(cache._root_keys.keys())[0]
+
+    class _RejectingProvider(dpapi_ng.KeyProvider):
+        def get_key(
+            self,
+            target_sd: bytes,
+            root_key_identifier: t.Optional[uuid.UUID],
+            l0: int,
+            l1: int,
+            l2: int,
+        ) -> gkdi.GroupKeyEnvelope:
+            gke = cache._get_key(target_sd, root_key_identifier, l0, l1, l2)
+            assert gke
+            if public:
+                return dataclasses.replace(gke, flags=1, l2_key=os.urandom(32))
+            else:
+                # A seed below the requested L2 index cannot derive it.
+                return dataclasses.replace(gke, l1=l1, l2=l2 - 1, l2_key=b"")
+
+    with pytest.raises(ValueError, match="Key provider"):
+        dpapi_ng.ncrypt_protect_secret(
+            b"x",
+            test_protection_descriptor,
+            root_key_identifier=root_key_id,
+            key_provider=_RejectingProvider(),
+        )
+
+
+def test_protect_async_provider_cancel_does_not_return_blob(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    test_protection_descriptor = "S-1-5-21-2185496602-3367037166-1388177638-1103"
+    _set_fixed_time(monkeypatch)
+
+    cache = _load_root_key("kdf_sha512_nonce")[1]
+    root_key_id = list(cache._root_keys.keys())[0]
+
+    class _SlowProvider(dpapi_ng.KeyProvider):
+        cancelled = False
+
+        async def async_get_key(
+            self,
+            target_sd: bytes,
+            root_key_identifier: t.Optional[uuid.UUID],
+            l0: int,
+            l1: int,
+            l2: int,
+        ) -> gkdi.GroupKeyEnvelope:
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
+
+            raise AssertionError("provider should have been cancelled")
+
+    async def _run() -> None:
+        provider = _SlowProvider()
+        task = asyncio.create_task(
+            dpapi_ng.async_ncrypt_protect_secret(
+                b"x",
+                test_protection_descriptor,
+                root_key_identifier=root_key_id,
+                key_provider=provider,
+            )
+        )
+        await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert provider.cancelled
+
+    asyncio.run(_run())
+

@@ -695,6 +695,27 @@ def compute_l2_key(
     request_l2: int,
     rk: GroupKeyEnvelope,
 ) -> bytes:
+    return compute_l1_l2_key(algorithm, request_l1, request_l2, rk)[1]
+
+
+def compute_l1_l2_key(
+    algorithm: hashes.HashAlgorithm,
+    request_l1: int,
+    request_l2: int,
+    rk: GroupKeyEnvelope,
+) -> tuple[bytes, bytes]:
+    """Derive the L1 seed and L2 key for the requested indices.
+
+    Args:
+        algorithm: The hash algorithm used by the KDF.
+        request_l1: The requested L1 index.
+        request_l2: The requested L2 index.
+        rk: The group key envelope containing the seed and its own indices.
+
+    Returns:
+        tuple[bytes, bytes]: The L1 key at ``request_l1`` and the L2 key at
+            ``request_l1``/``request_l2``.
+    """
     l1 = rk.l1
     l1_key = rk.l1_key
     l2 = rk.l2
@@ -758,7 +779,7 @@ def compute_l2_key(
             64,
         )
 
-    return l2_key
+    return l1_key, l2_key
 
 
 def compute_kdf_context(

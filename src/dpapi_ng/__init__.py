@@ -5,14 +5,18 @@ from __future__ import annotations
 
 from ._client import (
     KeyCache,
+    KeyProvider,
     async_ncrypt_protect_secret,
     async_ncrypt_unprotect_secret,
     ncrypt_protect_secret,
     ncrypt_unprotect_secret,
 )
+from ._gkdi import GroupKeyEnvelope
 
 __all__ = [
+    "GroupKeyEnvelope",
     "KeyCache",
+    "KeyProvider",
     "async_ncrypt_protect_secret",
     "async_ncrypt_unprotect_secret",
     "ncrypt_protect_secret",

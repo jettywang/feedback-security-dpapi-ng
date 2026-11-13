@@ -5,6 +5,9 @@
 + Dropped end of life Python versions 3.7, and 3.8
 + Added explicit support for Python 3.12, and 3.13
 + Added mininum version for the `cryptography` dep at `>= 3.4.4`
++ Added the `KeyProvider` interface to supply an offline key source to the
+  sync and async protect and unprotect functions. A single time slot is used
+  for each protect operation, including across an async time boundary.
 
 ## 0.2.0 - 2023-06-02
 

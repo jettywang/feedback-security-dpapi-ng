@@ -3,6 +3,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextvars
+import dataclasses
+import inspect
 import time
 import typing as t
 import uuid
@@ -26,7 +30,7 @@ from ._gkdi import (
     GroupKeyEnvelope,
     KDFParameters,
     compute_l1_key,
-    compute_l2_key,
+    compute_l1_l2_key,
 )
 from ._rpc import (
     NDR,
@@ -44,6 +48,12 @@ from ._rpc import (
 )
 
 _EPOCH_FILETIME = 116444736000000000  # 1970-01-01 as FILETIME
+
+# The L0/L1/L2 slots are 32 * 32 * 3.6 * 10**11, 32 * 3.6 * 10**11, and
+# 3.6 * 10**11 FILETIME units respectively (MS-GKDI 3.1.4.1).
+_TIME_SLOT = 360000000000
+_L1_TIME_SLOT = 32 * _TIME_SLOT
+_L0_TIME_SLOT = 32 * _L1_TIME_SLOT
 
 _EPM_CONTEXTS = [
     ContextElement(
@@ -282,48 +292,162 @@ def _encrypt_blob(
     ).pack()
 
 
-def _get_protection_gke_from_cache(
-    root_key_identifier: t.Optional[uuid.UUID],
-    target_sd: bytes,
-    cache: KeyCache,
-) -> t.Optional[GroupKeyEnvelope]:
-    if not root_key_identifier:
-        return None
+@dataclasses.dataclass(frozen=True)
+class _KeyIndices:
+    """The time derived L0/L1/L2 key hierarchy indices."""
 
-    # MS-GKDI 3.1.4.1 GetKey rules on how to generate the group key identifier
-    # values from the current time
-    # https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-gkdi/4cac87a3-521e-4918-a272-240f8fabed39
-    current_time = (time.time_ns() // 100) + _EPOCH_FILETIME
-    base = 360000000000  # 3.6 * 10**11
-    l0 = int(current_time / (32 * 32 * base))
-    l1 = int((current_time % (32 * 32 * base)) / (32 * base))
-    l2 = int((current_time % (32 * base)) / base)
+    l0: int
+    l1: int
+    l2: int
 
-    rk = cache._get_key(
-        target_sd,
-        root_key_identifier,
-        l0,
-        l1,
-        l2,
+
+# The time indices are sampled once at the start of a protect operation. This
+# context variable lets the cache helper and the RPC fallback use that same
+# sample even if an await crosses into a new time slot.
+_PROTECTION_INDICES: contextvars.ContextVar[t.Optional[_KeyIndices]] = contextvars.ContextVar(
+    "dpapi_ng_protection_indices",
+    default=None,
+)
+
+
+def _get_current_time() -> int:
+    """Return the current time as FILETIME (100 nanosecond intervals)."""
+    return (time.time_ns() // 100) + _EPOCH_FILETIME
+
+
+def _get_key_indices(
+    current_time: t.Optional[int] = None,
+) -> _KeyIndices:
+    """Convert a FILETIME value into the MS-GKDI L0/L1/L2 indices.
+
+    Args:
+        current_time: The FILETIME value to convert, defaults to the current
+            time.
+
+    Returns:
+        _KeyIndices: The L0/L1/L2 indices for the time specified.
+    """
+    if current_time is None:
+        current_time = _get_current_time()
+
+    return _KeyIndices(
+        l0=current_time // _L0_TIME_SLOT,
+        l1=(current_time % _L0_TIME_SLOT) // _L1_TIME_SLOT,
+        l2=(current_time % _L1_TIME_SLOT) // _TIME_SLOT,
     )
-    if not rk:
-        return None
 
-    kdf_parameters = KDFParameters.unpack(rk.kdf_parameters)
-    l2_key = compute_l2_key(
+
+def _get_protection_indices() -> _KeyIndices:
+    """Get the indices sampled for the current protect operation."""
+    indices = _PROTECTION_INDICES.get()
+    return indices if indices is not None else _get_key_indices()
+
+
+def _unpack_group_key_envelope(
+    value: t.Any,
+) -> GroupKeyEnvelope:
+    if isinstance(value, GroupKeyEnvelope):
+        return value
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return GroupKeyEnvelope.unpack(value)
+    raise ValueError("Key provider returned an invalid group key envelope")
+
+
+def _normalize_gke(
+    rk: GroupKeyEnvelope,
+    root_key_identifier: t.Optional[uuid.UUID],
+    indices: _KeyIndices,
+    allow_public: bool,
+    source: str,
+) -> GroupKeyEnvelope:
+    """Validate and normalize a group key envelope for the requested indices.
+
+    The envelope may be a seed at a higher L1/L2 index such as the (L0, 31,
+    31) value returned by the KDS. In that case the L2 key is derived for the
+    requested indices. The resulting envelope always carries the requested
+    L0/L1/L2 values so the key identifier written to the blob matches the
+    material that was used.
+
+    Args:
+        rk: The group key envelope returned by a key source.
+        root_key_identifier: The requested root key id, or None to use the
+            value from the envelope.
+        indices: The requested L0/L1/L2 indices.
+        allow_public: Whether a public envelope is allowed. Public envelopes
+            are only usable for protection when retrieved over RPC, not from
+            a local read-only provider.
+        source: A description of the key source for error messages.
+
+    Returns:
+        GroupKeyEnvelope: The envelope at the requested indices.
+
+    Raises:
+        ValueError: The envelope does not match the request or does not
+            contain usable seed material.
+    """
+    if rk.l0 != indices.l0:
+        raise ValueError(
+            f"{source} returned L0 index {rk.l0} which does not match the requested L0 index {indices.l0}"
+        )
+
+    if root_key_identifier is not None and rk.root_key_identifier != root_key_identifier:
+        raise ValueError(
+            f"{source} returned root key id {rk.root_key_identifier} which does not match the requested "
+            f"root key id {root_key_identifier}"
+        )
+
+    if rk.is_public_key:
+        if not allow_public:
+            raise ValueError(f"{source} returned a public group key envelope that cannot be used to protect data")
+        if (rk.l1, rk.l2) != (indices.l1, indices.l2):
+            raise ValueError(
+                f"{source} returned a public envelope for L1/L2 {(rk.l1, rk.l2)} which does not match the "
+                f"requested values {(indices.l1, indices.l2)}"
+            )
+        if not rk.l2_key:
+            raise ValueError(f"{source} returned a public envelope without public key material")
+
+        return rk
+
+    # A seed must be at, or above, the requested L1/L2 position. The KDS
+    # returns seeds at a higher index which can be derived backwards.
+    if rk.l1 < indices.l1 or (rk.l1 == indices.l1 and rk.l2 < indices.l2):
+        raise ValueError(
+            f"{source} returned a seed for L1/L2 {(rk.l1, rk.l2)} which cannot derive the requested "
+            f"values {(indices.l1, indices.l2)}"
+        )
+
+    if (rk.l1, rk.l2) == (indices.l1, indices.l2) and rk.l2_key:
+        # Already at the exact key requested.
+        return rk
+
+    if rk.l2_key:
+        seed = rk
+    elif rk.l1_key:
+        # The envelope carries the L1 seed at (L0, L1, 31) but no L2 key.
+        if rk.l2 != 31:
+            raise ValueError(
+                f"{source} returned an incomplete seed at L2 index {rk.l2} without L2 key material"
+            )
+        seed = dataclasses.replace(rk, l2=31, l2_key=b"")
+    else:
+        raise ValueError(f"{source} returned a group key envelope without seed material")
+
+    kdf_parameters = KDFParameters.unpack(seed.kdf_parameters)
+    l1_key, l2_key = compute_l1_l2_key(
         kdf_parameters.hash_algorithm,
-        l1,
-        l2,
-        rk,
+        indices.l1,
+        indices.l2,
+        seed,
     )
 
     return GroupKeyEnvelope(
         version=rk.version,
         flags=rk.flags,
-        l0=l0,
-        l1=l1,
-        l2=l2,
-        root_key_identifier=root_key_identifier,
+        l0=indices.l0,
+        l1=indices.l1,
+        l2=indices.l2,
+        root_key_identifier=root_key_identifier or rk.root_key_identifier,
         kdf_algorithm=rk.kdf_algorithm,
         kdf_parameters=rk.kdf_parameters,
         secret_algorithm=rk.secret_algorithm,
@@ -332,9 +456,352 @@ def _get_protection_gke_from_cache(
         public_key_length=rk.public_key_length,
         domain_name=rk.domain_name,
         forest_name=rk.forest_name,
-        l1_key=b"",
+        l1_key=l1_key,
         l2_key=l2_key,
     )
+
+
+def _validate_seed_gke(
+    rk: GroupKeyEnvelope,
+    root_key_identifier: uuid.UUID,
+    indices: _KeyIndices,
+    source: str,
+) -> GroupKeyEnvelope:
+    """Validate a seed envelope without changing the indices it carries.
+
+    Unlike the protect path the unprotect path uses the indices from the blob
+    itself. The seed may be at a higher L1/L2 index and is derived by
+    :meth:`GroupKeyEnvelope.get_kek` as part of the normal flow. Only seeds
+    that can actually derive the requested values are accepted.
+
+    Args:
+        rk: The group key envelope returned by a key source.
+        root_key_identifier: The root key id from the blob.
+        indices: The L0/L1/L2 indices from the blob.
+        source: A description of the key source for error messages.
+
+    Returns:
+        GroupKeyEnvelope: The unmodified envelope.
+
+    Raises:
+        ValueError: The envelope does not match the requested key or does not
+            contain usable seed material.
+    """
+    if rk.l0 != indices.l0:
+        raise ValueError(
+            f"{source} returned L0 index {rk.l0} which does not match the requested L0 index {indices.l0}"
+        )
+
+    if rk.root_key_identifier != root_key_identifier:
+        raise ValueError(
+            f"{source} returned root key id {rk.root_key_identifier} which does not match the requested "
+            f"root key id {root_key_identifier}"
+        )
+
+    if rk.is_public_key:
+        raise ValueError(f"{source} returned a public group key envelope that cannot be used to unprotect data")
+
+    if rk.l1 < indices.l1 or (rk.l1 == indices.l1 and rk.l2 < indices.l2):
+        raise ValueError(
+            f"{source} returned a seed for L1/L2 {(rk.l1, rk.l2)} which cannot derive the requested "
+            f"values {(indices.l1, indices.l2)}"
+        )
+
+    if not rk.l2_key and not rk.l1_key:
+        raise ValueError(f"{source} returned a group key envelope without seed material")
+
+    return rk
+
+
+def _provider_method(
+    key_provider: t.Any,
+    prefer_async: bool,
+) -> t.Callable[..., t.Any]:
+    # The base class methods raise NotImplementedError. Treat an unimplemented
+    # base method as absent so a subclass only needs to implement one of them.
+    method_names = ["async_get_key", "get_key"] if prefer_async else ["get_key", "async_get_key"]
+    for method_name in method_names:
+        method = getattr(key_provider, method_name, None)
+        if callable(method) and not _is_base_provider_method(method_name, method):
+            return method
+
+    if callable(key_provider):
+        return key_provider
+
+    raise ValueError("Key provider must define get_key or async_get_key")
+
+
+def _is_base_provider_method(
+    method_name: str,
+    method: t.Callable[..., t.Any],
+) -> bool:
+    func = getattr(method, "__func__", method)
+    return func is getattr(KeyProvider, method_name, None)
+
+
+def _call_provider_sync(
+    key_provider: t.Any,
+    target_sd: bytes,
+    root_key_identifier: t.Optional[uuid.UUID],
+    indices: _KeyIndices,
+) -> t.Any:
+    method = _provider_method(key_provider, prefer_async=False)
+    args = (target_sd, root_key_identifier, indices.l0, indices.l1, indices.l2)
+
+    if inspect.iscoroutinefunction(method):
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(method(*args))
+        raise ValueError("An async key provider cannot be used with the sync API while an event loop is running")
+
+    result = method(*args)
+    if inspect.isawaitable(result):
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(result)
+        raise ValueError("An async key provider cannot be used with the sync API while an event loop is running")
+
+    return result
+
+
+async def _call_provider_async(
+    key_provider: t.Any,
+    target_sd: bytes,
+    root_key_identifier: t.Optional[uuid.UUID],
+    indices: _KeyIndices,
+) -> t.Any:
+    method = _provider_method(key_provider, prefer_async=True)
+    args = (target_sd, root_key_identifier, indices.l0, indices.l1, indices.l2)
+
+    if inspect.iscoroutinefunction(method):
+        result = await method(*args)
+    else:
+        # Do not block the event loop with a local, potentially slow, provider.
+        result = await asyncio.to_thread(method, *args)
+        if inspect.isawaitable(result):
+            result = await result
+
+    return result
+
+
+def _get_provider_gke(
+    key_provider: t.Any,
+    target_sd: bytes,
+    root_key_identifier: t.Optional[uuid.UUID],
+    indices: _KeyIndices,
+) -> t.Optional[GroupKeyEnvelope]:
+    value = _call_provider_sync(key_provider, target_sd, root_key_identifier, indices)
+    if value is None:
+        return None
+
+    return _normalize_gke(
+        _unpack_group_key_envelope(value),
+        root_key_identifier,
+        indices,
+        allow_public=False,
+        source="Key provider",
+    )
+
+
+async def _async_get_provider_gke(
+    key_provider: t.Any,
+    target_sd: bytes,
+    root_key_identifier: t.Optional[uuid.UUID],
+    indices: _KeyIndices,
+) -> t.Optional[GroupKeyEnvelope]:
+    value = await _call_provider_async(key_provider, target_sd, root_key_identifier, indices)
+    if value is None:
+        return None
+
+    return _normalize_gke(
+        _unpack_group_key_envelope(value),
+        root_key_identifier,
+        indices,
+        allow_public=False,
+        source="Key provider",
+    )
+
+
+def _get_protection_gke_from_cache(
+    root_key_identifier: t.Optional[uuid.UUID],
+    target_sd: bytes,
+    cache: KeyCache,
+    indices: t.Optional[_KeyIndices] = None,
+) -> t.Optional[GroupKeyEnvelope]:
+    if not root_key_identifier:
+        return None
+
+    if indices is None:
+        indices = _get_protection_indices()
+
+    rk = cache._get_key(
+        target_sd,
+        root_key_identifier,
+        indices.l0,
+        indices.l1,
+        indices.l2,
+    )
+    if not rk:
+        return None
+
+    return _normalize_gke(
+        rk,
+        root_key_identifier,
+        indices,
+        allow_public=True,
+        source="Key cache",
+    )
+
+
+def _resolve_protection_key(
+    key_provider: t.Any,
+    root_key_identifier: t.Optional[uuid.UUID],
+    target_sd: bytes,
+    indices: _KeyIndices,
+    cache: KeyCache,
+    server: t.Optional[str],
+    domain_name: t.Optional[str],
+    username: t.Optional[str],
+    password: t.Optional[str],
+    auth_protocol: str,
+) -> GroupKeyEnvelope:
+    if key_provider is not None:
+        rk = _get_provider_gke(key_provider, target_sd, root_key_identifier, indices)
+        if rk:
+            return rk
+
+        rk = _get_protection_gke_from_cache(root_key_identifier, target_sd, cache)
+    else:
+        # Preserve the existing cache hook as the first cache lookup for
+        # callers without an injected provider.
+        rk = _get_protection_gke_from_cache(root_key_identifier, target_sd, cache)
+
+    if rk:
+        return rk
+
+    if not server:
+        server = lookup_dc(domain_name).target
+
+    return _normalize_gke(
+        _sync_get_key(
+            server,
+            target_sd,
+            root_key_identifier,
+            indices.l0,
+            indices.l1,
+            indices.l2,
+            username=username,
+            password=password,
+            auth_protocol=auth_protocol,
+        ),
+        root_key_identifier,
+        indices,
+        allow_public=True,
+        source="Domain controller",
+    )
+
+
+async def _async_resolve_protection_key(
+    key_provider: t.Any,
+    root_key_identifier: t.Optional[uuid.UUID],
+    target_sd: bytes,
+    indices: _KeyIndices,
+    cache: KeyCache,
+    server: t.Optional[str],
+    domain_name: t.Optional[str],
+    username: t.Optional[str],
+    password: t.Optional[str],
+    auth_protocol: str,
+) -> GroupKeyEnvelope:
+    if key_provider is not None:
+        rk = await _async_get_provider_gke(key_provider, target_sd, root_key_identifier, indices)
+        if rk:
+            return rk
+
+        rk = _get_protection_gke_from_cache(root_key_identifier, target_sd, cache)
+    else:
+        rk = _get_protection_gke_from_cache(root_key_identifier, target_sd, cache)
+
+    if rk:
+        return rk
+
+    if not server:
+        server = (await async_lookup_dc(domain_name)).target
+
+    return _normalize_gke(
+        await _async_get_key(
+            server,
+            target_sd,
+            root_key_identifier,
+            indices.l0,
+            indices.l1,
+            indices.l2,
+            username=username,
+            password=password,
+            auth_protocol=auth_protocol,
+        ),
+        root_key_identifier,
+        indices,
+        allow_public=True,
+        source="Domain controller",
+    )
+
+
+class KeyProvider:
+    """Read-only offline key source.
+
+    A key provider can be passed to the sync and async protect and unprotect
+    functions to supply GKDI group key envelopes from an offline source
+    instead of the :class:`KeyCache` or an RPC call.
+
+    Implement :meth:`get_key` for a local synchronous provider, or
+    :meth:`async_get_key` when the key material is retrieved asynchronously.
+    A provider that implements :meth:`get_key` can be used with both the sync
+    and async functions. It can also be any callable with the same signature.
+
+    The provider must return a private :class:`GroupKeyEnvelope` at, or above,
+    the requested ``l0``/``l1``/``l2`` indices. Seeds returned at a higher
+    index are derived to the requested values. Returning a public envelope
+    or a seed that cannot derive the requested values is rejected.
+
+    The provider may return a serialized ``GroupKeyEnvelope`` instead of the
+    object itself. When no provider is given, or when it returns ``None``,
+    the ``cache`` is consulted and then the domain controller over RPC.
+
+    Args:
+        target_sd: The security descriptor the key is for.
+        root_key_identifier: The root key id requested. This is ``None`` when
+            the caller did not specify one for a protect operation.
+        l0: The requested L0 index.
+        l1: The requested L1 index.
+        l2: The requested L2 index.
+
+    Returns:
+        Optional[GroupKeyEnvelope]: The group key envelope, or None when this
+            provider does not have the requested key.
+    """
+
+    def get_key(
+        self,
+        target_sd: bytes,
+        root_key_identifier: t.Optional[uuid.UUID],
+        l0: int,
+        l1: int,
+        l2: int,
+    ) -> t.Optional[GroupKeyEnvelope]:
+        raise NotImplementedError()
+
+    async def async_get_key(
+        self,
+        target_sd: bytes,
+        root_key_identifier: t.Optional[uuid.UUID],
+        l0: int,
+        l1: int,
+        l2: int,
+    ) -> t.Optional[GroupKeyEnvelope]:
+        raise NotImplementedError()
 
 
 class RootKey(t.NamedTuple):
@@ -549,6 +1016,7 @@ def ncrypt_unprotect_secret(
     password: t.Optional[str] = None,
     auth_protocol: str = "negotiate",
     cache: t.Optional[KeyCache] = None,
+    key_provider: t.Optional[t.Any] = None,
 ) -> bytes:
     """Decrypt DPAPI-NG Blob.
 
@@ -576,6 +1044,8 @@ def ncrypt_unprotect_secret(
             ``negotiate`` but can be ``kerberos`` or ``ntlm``.
         cache: Optional cache that is used as the key source to avoid making
             the RPC call.
+        key_provider: Optional read-only key provider used before the cache
+            and RPC sources. See :class:`KeyProvider`.
 
     Returns:
         bytes: The decrypt DPAPI-NG data.
@@ -591,36 +1061,126 @@ def ncrypt_unprotect_secret(
     blob = DPAPINGBlob.unpack(data)
     target_sd = blob.protection_descriptor.get_target_sd()
 
-    cache = cache or KeyCache()
-    rk = cache._get_key(
-        target_sd,
-        blob.key_identifier.root_key_identifier,
-        blob.key_identifier.l0,
-        blob.key_identifier.l1,
-        blob.key_identifier.l2,
+    indices = _KeyIndices(
+        l0=blob.key_identifier.l0,
+        l1=blob.key_identifier.l1,
+        l2=blob.key_identifier.l2,
     )
 
-    if not rk:
-        if not server:
-            srv = lookup_dc(blob.key_identifier.domain_name)
-            server = srv.target
-
-        rk = _sync_get_key(
-            server,
-            target_sd,
-            blob.key_identifier.root_key_identifier,
-            blob.key_identifier.l0,
-            blob.key_identifier.l1,
-            blob.key_identifier.l2,
-            username=username,
-            password=password,
-            auth_protocol=auth_protocol,
-        )
+    cache = cache or KeyCache()
+    rk = _resolve_unprotect_key(
+        key_provider,
+        blob.key_identifier.root_key_identifier,
+        target_sd,
+        indices,
+        cache,
+        server,
+        blob.key_identifier.domain_name,
+        username,
+        password,
+        auth_protocol,
+    )
 
     if not rk.is_public_key:
         cache._store_key(target_sd, rk)
 
     return _decrypt_blob(blob, rk)
+
+
+def _resolve_unprotect_key(
+    key_provider: t.Any,
+    root_key_identifier: uuid.UUID,
+    target_sd: bytes,
+    indices: _KeyIndices,
+    cache: KeyCache,
+    server: t.Optional[str],
+    domain_name: t.Optional[str],
+    username: t.Optional[str],
+    password: t.Optional[str],
+    auth_protocol: str,
+) -> GroupKeyEnvelope:
+    if key_provider is not None:
+        value = _call_provider_sync(key_provider, target_sd, root_key_identifier, indices)
+        if value is not None:
+            return _validate_seed_gke(
+                _unpack_group_key_envelope(value),
+                root_key_identifier,
+                indices,
+                "Key provider",
+            )
+
+    rk = cache._get_key(
+        target_sd,
+        root_key_identifier,
+        indices.l0,
+        indices.l1,
+        indices.l2,
+    )
+    if rk:
+        return rk
+
+    if not server:
+        server = lookup_dc(domain_name).target
+
+    return _sync_get_key(
+        server,
+        target_sd,
+        root_key_identifier,
+        indices.l0,
+        indices.l1,
+        indices.l2,
+        username=username,
+        password=password,
+        auth_protocol=auth_protocol,
+    )
+
+
+async def _async_resolve_unprotect_key(
+    key_provider: t.Any,
+    root_key_identifier: uuid.UUID,
+    target_sd: bytes,
+    indices: _KeyIndices,
+    cache: KeyCache,
+    server: t.Optional[str],
+    domain_name: t.Optional[str],
+    username: t.Optional[str],
+    password: t.Optional[str],
+    auth_protocol: str,
+) -> GroupKeyEnvelope:
+    if key_provider is not None:
+        value = await _call_provider_async(key_provider, target_sd, root_key_identifier, indices)
+        if value is not None:
+            return _validate_seed_gke(
+                _unpack_group_key_envelope(value),
+                root_key_identifier,
+                indices,
+                "Key provider",
+            )
+
+    rk = cache._get_key(
+        target_sd,
+        root_key_identifier,
+        indices.l0,
+        indices.l1,
+        indices.l2,
+    )
+    if rk:
+        return rk
+
+    if not server:
+        server = (await async_lookup_dc(domain_name)).target
+
+    return await _async_get_key(
+        server,
+        target_sd,
+        root_key_identifier,
+        indices.l0,
+        indices.l1,
+        indices.l2,
+        username=username,
+        password=password,
+        auth_protocol=auth_protocol,
+    )
 
 
 def ncrypt_protect_secret(
@@ -633,6 +1193,7 @@ def ncrypt_protect_secret(
     password: t.Optional[str] = None,
     auth_protocol: str = "negotiate",
     cache: t.Optional[KeyCache] = None,
+    key_provider: t.Optional[t.Any] = None,
 ) -> bytes:
     """Encrypt DPAPI-NG Blob.
 
@@ -652,6 +1213,11 @@ def ncrypt_protect_secret(
     sure to install the Kerberos extras package ``dpapi-ng[kerberos]`` to ensure
     Kerberos auth can be used.
 
+    A single key hierarchy time slot and protection descriptor are used for
+    the whole operation. If a local key source is used and it returns after
+    the time slot has changed, the key identifier in the blob still matches
+    the derived key material.
+
     Args:
         data: The bytes blob to encrypt.
         protection_descriptor: The security identifier to protect the secret
@@ -668,6 +1234,8 @@ def ncrypt_protect_secret(
         cache: Optional cache that is used as the key source to avoid making
             the RPC call. This only works if root_key_identifier is also
             specified.
+        key_provider: Optional read-only key provider used before the cache
+            and RPC sources. See :class:`KeyProvider`.
 
     Returns:
         bytes: The encrypted DPAPI-NG data.
@@ -680,37 +1248,32 @@ def ncrypt_protect_secret(
     _NCryptProtectSecret:
         https://learn.microsoft.com/en-us/windows/win32/api/ncryptprotect/nf-ncryptprotect-ncryptprotectsecret
     """
-    l0 = -1
-    l1 = -1
-    l2 = -1
-
     descriptor = ProtectionDescriptor.parse(protection_descriptor)
     sd = descriptor.get_target_sd()
 
-    cache = cache or KeyCache()
-    rk = _get_protection_gke_from_cache(root_key_identifier, sd, cache)
-
-    if not rk:
-        if not server:
-            srv = lookup_dc(domain_name)
-            server = srv.target
-
-        rk = _sync_get_key(
-            server,
-            sd,
+    indices = _get_key_indices()
+    token = _PROTECTION_INDICES.set(indices)
+    try:
+        cache = cache or KeyCache()
+        rk = _resolve_protection_key(
+            key_provider,
             root_key_identifier,
-            l0,
-            l1,
-            l2,
-            username=username,
-            password=password,
-            auth_protocol=auth_protocol,
+            sd,
+            indices,
+            cache,
+            server,
+            domain_name,
+            username,
+            password,
+            auth_protocol,
         )
 
-    if not rk.is_public_key:
-        cache._store_key(sd, rk)
+        if not rk.is_public_key:
+            cache._store_key(sd, rk)
 
-    return _encrypt_blob(data, rk, descriptor)
+        return _encrypt_blob(data, rk, descriptor)
+    finally:
+        _PROTECTION_INDICES.reset(token)
 
 
 async def async_ncrypt_unprotect_secret(
@@ -720,6 +1283,7 @@ async def async_ncrypt_unprotect_secret(
     password: t.Optional[str] = None,
     auth_protocol: str = "negotiate",
     cache: t.Optional[KeyCache] = None,
+    key_provider: t.Optional[t.Any] = None,
 ) -> bytes:
     """Decrypt DPAPI-NG Blob.
 
@@ -747,6 +1311,8 @@ async def async_ncrypt_unprotect_secret(
             ``negotiate`` but can be ``kerberos`` or ``ntlm``.
         cache: Optional cache that is used as the key source to avoid making
             the RPC call.
+        key_provider: Optional read-only key provider used before the cache
+            and RPC sources. See :class:`KeyProvider`.
 
     Returns:
         bytes: The decrypt DPAPI-NG data.
@@ -762,30 +1328,25 @@ async def async_ncrypt_unprotect_secret(
     blob = DPAPINGBlob.unpack(data)
     target_sd = blob.protection_descriptor.get_target_sd()
 
-    cache = cache or KeyCache()
-    rk = cache._get_key(
-        target_sd,
-        blob.key_identifier.root_key_identifier,
-        blob.key_identifier.l0,
-        blob.key_identifier.l1,
-        blob.key_identifier.l2,
+    indices = _KeyIndices(
+        l0=blob.key_identifier.l0,
+        l1=blob.key_identifier.l1,
+        l2=blob.key_identifier.l2,
     )
-    if not rk:
-        if not server:
-            srv = await async_lookup_dc(blob.key_identifier.domain_name)
-            server = srv.target
 
-        rk = await _async_get_key(
-            server,
-            target_sd,
-            blob.key_identifier.root_key_identifier,
-            blob.key_identifier.l0,
-            blob.key_identifier.l1,
-            blob.key_identifier.l2,
-            username=username,
-            password=password,
-            auth_protocol=auth_protocol,
-        )
+    cache = cache or KeyCache()
+    rk = await _async_resolve_unprotect_key(
+        key_provider,
+        blob.key_identifier.root_key_identifier,
+        target_sd,
+        indices,
+        cache,
+        server,
+        blob.key_identifier.domain_name,
+        username,
+        password,
+        auth_protocol,
+    )
 
     if not rk.is_public_key:
         cache._store_key(target_sd, rk)
@@ -803,6 +1364,7 @@ async def async_ncrypt_protect_secret(
     password: t.Optional[str] = None,
     auth_protocol: str = "negotiate",
     cache: t.Optional[KeyCache] = None,
+    key_provider: t.Optional[t.Any] = None,
 ) -> bytes:
     """Encrypt DPAPI-NG Blob.
 
@@ -822,6 +1384,11 @@ async def async_ncrypt_protect_secret(
     sure to install the Kerberos extras package ``dpapi-ng[kerberos]`` to ensure
     Kerberos auth can be used.
 
+    A single key hierarchy time slot and protection descriptor are used for
+    the whole operation. If a local key source is used and it returns after
+    the time slot has changed, the key identifier in the blob still matches
+    the derived key material.
+
     Args:
         data: The bytes blob to encrypt.
         protection_descriptor: The security identifier to protect the secret
@@ -838,6 +1405,8 @@ async def async_ncrypt_protect_secret(
         cache: Optional cache that is used as the key source to avoid making
             the RPC call. This only works if root_key_identifier is also
             specified.
+        key_provider: Optional read-only key provider used before the cache
+            and RPC sources. See :class:`KeyProvider`.
 
     Returns:
         bytes: The encrypted DPAPI-NG data.
@@ -850,34 +1419,31 @@ async def async_ncrypt_protect_secret(
     _NCryptProtectSecret:
         https://learn.microsoft.com/en-us/windows/win32/api/ncryptprotect/nf-ncryptprotect-ncryptprotectsecret
     """
-    l0 = -1
-    l1 = -1
-    l2 = -1
-
     descriptor = ProtectionDescriptor.parse(protection_descriptor)
     sd = descriptor.get_target_sd()
 
-    cache = cache or KeyCache()
-    rk = _get_protection_gke_from_cache(root_key_identifier, sd, cache)
-
-    if not rk:
-        if not server:
-            srv = await async_lookup_dc(domain_name)
-            server = srv.target
-
-        rk = await _async_get_key(
-            server,
-            sd,
+    indices = _get_key_indices()
+    token = _PROTECTION_INDICES.set(indices)
+    try:
+        cache = cache or KeyCache()
+        rk = await _async_resolve_protection_key(
+            key_provider,
             root_key_identifier,
-            l0,
-            l1,
-            l2,
-            username=username,
-            password=password,
-            auth_protocol=auth_protocol,
+            sd,
+            indices,
+            cache,
+            server,
+            domain_name,
+            username,
+            password,
+            auth_protocol,
         )
 
-    if not rk.is_public_key:
-        cache._store_key(sd, rk)
+        if not rk.is_public_key:
+            cache._store_key(sd, rk)
+    finally:
+        _PROTECTION_INDICES.reset(token)
 
+    # Once the key material has been resolved there are no further await
+    # points. A cancelled operation cannot return a partially built blob.
     return _encrypt_blob(data, rk, descriptor)
