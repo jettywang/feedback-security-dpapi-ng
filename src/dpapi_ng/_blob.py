@@ -87,10 +87,16 @@ class KeyIdentifier:
     ) -> KeyIdentifier:
         view = memoryview(data)
 
+        header_len = 52
+        buffer_len = len(view)
         version = int.from_bytes(view[:4], byteorder="little")
 
         if view[4:8].tobytes() != cls.magic:
             raise ValueError(f"Failed to unpack {cls.__name__} as magic identifier is invalid")
+        if len(view) < header_len:
+            raise ValueError(
+                f"Failed to unpack {cls.__name__} as the data is shorter than the {header_len} byte header"
+            )
 
         flags = int.from_bytes(view[8:12], byteorder="little")
         l0_index = int.from_bytes(view[12:16], byteorder="little")
@@ -100,17 +106,61 @@ class KeyIdentifier:
         key_info_len = int.from_bytes(view[40:44], byteorder="little")
         domain_len = int.from_bytes(view[44:48], byteorder="little")
         forest_len = int.from_bytes(view[48:52], byteorder="little")
-        view = view[52:]
+        view = view[header_len:]
 
-        key_info = view[:key_info_len].tobytes()
-        view = view[key_info_len:]
+        def take_bytes(field: str, length: int, minimum: int = 0) -> memoryview:
+            nonlocal view
+            offset = buffer_len - len(view)
+            if length < minimum:
+                raise ValueError(
+                    f"Failed to unpack {cls.__name__} as the {field} at offset {offset} has length {length}, "
+                    f"smaller than the minimum {minimum}"
+                )
+            if length > len(view):
+                raise ValueError(
+                    f"Failed to unpack {cls.__name__} as the {field} at offset {offset} has length {length}, "
+                    f"exceeding the {len(view)} remaining bytes"
+                )
+            chunk = view[:length]
+            view = view[length:]
+            return chunk
 
-        # Take away 2 for the final null padding
-        domain = view[: domain_len - 2].tobytes().decode("utf-16-le")
-        view = view[domain_len:]
+        def take_string(field: str, length: int) -> str:
+            field_offset = buffer_len - len(view)
+            chunk = take_bytes(field, length, minimum=2)
+            body_offset = field_offset
+            if chunk[-2:].tobytes() != b"\x00\x00":
+                raise ValueError(
+                    f"Failed to unpack {cls.__name__} as the {field} at offset {field_offset} "
+                    f"is missing its null terminator at offset {field_offset + length - 2}"
+                )
+            body = chunk[:-2].tobytes()
+            terminator = next(
+                (index for index in range(0, len(body), 2) if body[index : index + 2] == b"\x00\x00"),
+                None,
+            )
+            if terminator is not None:
+                raise ValueError(
+                    f"Failed to unpack {cls.__name__} as the {field} at offset {field_offset} "
+                    f"contains an embedded null code unit at offset {body_offset + terminator}"
+                )
+            try:
+                return body.decode("utf-16-le")
+            except UnicodeDecodeError as exc:
+                raise ValueError(
+                    f"Failed to unpack {cls.__name__} as the {field} at offset {field_offset} "
+                    f"has invalid UTF-16 at offset {body_offset + exc.start} ({exc.reason})"
+                )
 
-        forest = view[: forest_len - 2].tobytes().decode("utf-16-le")
-        view = view[forest_len:]
+        key_info = take_bytes("key_info", key_info_len).tobytes()
+        domain = take_string("domain_name", domain_len)
+        forest = take_string("forest_name", forest_len)
+
+        if len(view):
+            raise ValueError(
+                f"Failed to unpack {cls.__name__} as {len(view)} unexpected bytes at offset "
+                f"{buffer_len - len(view)} remain after the last field"
+            )
 
         return KeyIdentifier(
             version=version,

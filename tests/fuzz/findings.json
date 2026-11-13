@@ -1,0 +1,612 @@
+{
+  "seed": 20261113,
+  "recorded_against": "baseline eac650f",
+  "records": [
+    {
+      "id": "envelope:truncation",
+      "struct": "envelope",
+      "category": "truncation",
+      "source_case": "envelope:truncate-1",
+      "description": "drop final 1 byte(s) of a legal sample",
+      "original_size": 291,
+      "minimized_size": 260,
+      "data_base64": "AQAAAEtEU0sCAAAA6AMAAB8AAAAHAAAA/HRB8MGYYRiOweRfdSjecCYAAAAYAAAABgAAABAAAAAAAgAAAAgAACAAAAAgAAAAIAAAACAAAABTAFAAOAAwADAAXwAxADAAOABfAEMAVABSAF8ASABNAEEAQwAAAAAAAAABAAAADgAAAAAAAABTSEE1MTIAAEQASAAAACJOxNuv3s8sKvUfeZBct4JhAGwAcABoAGEALQAwAC4AaQBuAHYAYQBsAGkAZAAAAGIAcgBhAHYAbwAtADAALgBpAG4AdgBhAGwAaQBkAAAAkryj4R4RzkT3mVvtN0jAs81XNOqoIVppOBZOGbeTlyk=",
+      "checkpoint": 260,
+      "inspector": {
+        "deviation": "length_overrun",
+        "field": "l2_key",
+        "detail": "declared 32 bytes from 260 ends at 292, buffer is 260",
+        "span_start": null
+      },
+      "baseline": {
+        "accepted": true,
+        "exception": null,
+        "interpretation": {
+          "version": 1,
+          "flags": 2,
+          "l0": 1000,
+          "l1": 31,
+          "l2": 7,
+          "kdf_algorithm": "'SP800_108_CTR_HMAC'",
+          "secret_algorithm": "'DH'",
+          "domain_name": "'alpha-0.invalid'",
+          "forest_name": "'bravo-0.invalid'",
+          "private_key_length": 512,
+          "public_key_length": 2048,
+          "kdf_parameters": {
+            "length": 24,
+            "hex": "00000000010000000e000000000000005348413531320000"
+          },
+          "secret_parameters": {
+            "length": 16,
+            "hex": "224ec4dbafdecf2c2af51f79905cb782"
+          },
+          "l1_key": {
+            "length": 32,
+            "hex": "92bca3e11e11ce44f7995bed3748c0b3cd5734eaa8215a6938164e19b7939729"
+          },
+          "l2_key": {
+            "length": 0,
+            "hex": ""
+          }
+        }
+      },
+      "hardened": {
+        "accepted": false,
+        "exception": "ValueError"
+      }
+    },
+    {
+      "id": "envelope:trailing",
+      "struct": "envelope",
+      "category": "trailing",
+      "source_case": "envelope:trailing-4",
+      "description": "append 4 bytes after the final declared field",
+      "original_size": 296,
+      "minimized_size": 293,
+      "data_base64": "AQAAAEtEU0sCAAAA6AMAAB8AAAAHAAAA/HRB8MGYYRiOweRfdSjecCYAAAAYAAAABgAAABAAAAAAAgAAAAgAACAAAAAgAAAAIAAAACAAAABTAFAAOAAwADAAXwAxADAAOABfAEMAVABSAF8ASABNAEEAQwAAAAAAAAABAAAADgAAAAAAAABTSEE1MTIAAEQASAAAACJOxNuv3s8sKvUfeZBct4JhAGwAcABoAGEALQAwAC4AaQBuAHYAYQBsAGkAZAAAAGIAcgBhAHYAbwAtADAALgBpAG4AdgBhAGwAaQBkAAAAkryj4R4RzkT3mVvtN0jAs81XNOqoIVppOBZOGbeTlyl1FtHe58+b348m82blWVoZxVWhU123R1EKZak+BYQcoN4=",
+      "checkpoint": 292,
+      "inspector": {
+        "deviation": "trailing_bytes",
+        "field": null,
+        "detail": "1 bytes after the last field",
+        "span_start": null
+      },
+      "baseline": {
+        "accepted": true,
+        "exception": null,
+        "interpretation": {
+          "version": 1,
+          "flags": 2,
+          "l0": 1000,
+          "l1": 31,
+          "l2": 7,
+          "kdf_algorithm": "'SP800_108_CTR_HMAC'",
+          "secret_algorithm": "'DH'",
+          "domain_name": "'alpha-0.invalid'",
+          "forest_name": "'bravo-0.invalid'",
+          "private_key_length": 512,
+          "public_key_length": 2048,
+          "kdf_parameters": {
+            "length": 24,
+            "hex": "00000000010000000e000000000000005348413531320000"
+          },
+          "secret_parameters": {
+            "length": 16,
+            "hex": "224ec4dbafdecf2c2af51f79905cb782"
+          },
+          "l1_key": {
+            "length": 32,
+            "hex": "92bca3e11e11ce44f7995bed3748c0b3cd5734eaa8215a6938164e19b7939729"
+          },
+          "l2_key": {
+            "length": 32,
+            "hex": "7516d1dee7cf9bdf8f26f366e5595a19c555a1535db747510a65a93e05841ca0"
+          }
+        }
+      },
+      "hardened": {
+        "accepted": false,
+        "exception": "ValueError"
+      }
+    },
+    {
+      "id": "envelope:boundary",
+      "struct": "envelope",
+      "category": "boundary",
+      "source_case": "envelope:compensated:secret_algorithm_len:secret_parameters_len.1",
+      "description": "secret_algorithm_len grows +2 into secret_parameters_len, secret_parameters_len shrinks -2; total length fixed",
+      "original_size": 292,
+      "minimized_size": 150,
+      "data_base64": "AQAAAEtEU0sCAAAA6QMAAB4AAAAIAAAA2hoplBsGfsFqOc4NErW2rSYAAAAYAAAACAAAAA4AAAAAAgAAAAgAACAAAAAgAAAAIAAAACAAAABTAFAAOAAwADAAXwAxADAAOABfAEMAVABSAF8ASABNAEEAQwAAAAAAAAABAAAADgAAAAAAAABTSEE1MTIAAEQASAAAAEkW",
+      "checkpoint": 148,
+      "inspector": {
+        "deviation": "bad_terminator",
+        "field": "secret_algorithm",
+        "detail": "final code unit 4916 at 148 is not NUL",
+        "span_start": null
+      },
+      "baseline": {
+        "accepted": true,
+        "exception": null,
+        "interpretation": {
+          "version": 1,
+          "flags": 2,
+          "l0": 1001,
+          "l1": 30,
+          "l2": 8,
+          "kdf_algorithm": "'SP800_108_CTR_HMAC'",
+          "secret_algorithm": "'DH\\x00'",
+          "domain_name": "''",
+          "forest_name": "''",
+          "private_key_length": 512,
+          "public_key_length": 2048,
+          "kdf_parameters": {
+            "length": 24,
+            "hex": "00000000010000000e000000000000005348413531320000"
+          },
+          "secret_parameters": {
+            "length": 0,
+            "hex": ""
+          },
+          "l1_key": {
+            "length": 0,
+            "hex": ""
+          },
+          "l2_key": {
+            "length": 0,
+            "hex": ""
+          }
+        }
+      },
+      "hardened": {
+        "accepted": false,
+        "exception": "ValueError"
+      }
+    },
+    {
+      "id": "envelope:length_prefix",
+      "struct": "envelope",
+      "category": "length_prefix",
+      "source_case": "envelope:len:kdf_algorithm_len.zero.1",
+      "description": "kdf_algorithm_len length 38 -> 0",
+      "original_size": 292,
+      "minimized_size": 80,
+      "data_base64": "AQAAAEtEU0sCAAAA6QMAAB4AAAAIAAAA2hoplBsGfsFqOc4NErW2rQAAAAAYAAAABgAAABAAAAAAAgAAAAgAACAAAAAgAAAAIAAAACAAAAA=",
+      "checkpoint": 80,
+      "inspector": {
+        "deviation": "short_string",
+        "field": "kdf_algorithm",
+        "detail": "declared 0 < 2 byte NUL terminator",
+        "span_start": null
+      },
+      "baseline": {
+        "accepted": true,
+        "exception": null,
+        "interpretation": {
+          "version": 1,
+          "flags": 2,
+          "l0": 1001,
+          "l1": 30,
+          "l2": 8,
+          "kdf_algorithm": "''",
+          "secret_algorithm": "''",
+          "domain_name": "''",
+          "forest_name": "''",
+          "private_key_length": 512,
+          "public_key_length": 2048,
+          "kdf_parameters": {
+            "length": 0,
+            "hex": ""
+          },
+          "secret_parameters": {
+            "length": 0,
+            "hex": ""
+          },
+          "l1_key": {
+            "length": 0,
+            "hex": ""
+          },
+          "l2_key": {
+            "length": 0,
+            "hex": ""
+          }
+        }
+      },
+      "hardened": {
+        "accepted": false,
+        "exception": "ValueError"
+      }
+    },
+    {
+      "id": "envelope:length_prefix",
+      "struct": "envelope",
+      "category": "length_prefix",
+      "source_case": "envelope:len:kdf_parameters_len.u32-max.1",
+      "description": "kdf_parameters_len length 24 -> 4294967295",
+      "original_size": 292,
+      "minimized_size": 118,
+      "data_base64": "AQAAAEtEU0sCAAAA6QMAAB4AAAAIAAAA2hoplBsGfsFqOc4NErW2rSYAAAD/////BgAAABAAAAAAAgAAAAgAACAAAAAgAAAAIAAAACAAAABTAFAAOAAwADAAXwAxADAAOABfAEMAVABSAF8ASABNAEEAQwAAAA==",
+      "checkpoint": 118,
+      "inspector": {
+        "deviation": "length_overrun",
+        "field": "kdf_parameters",
+        "detail": "declared 4294967295 bytes from 118 ends at 4294967413, buffer is 118",
+        "span_start": null
+      },
+      "baseline": {
+        "accepted": true,
+        "exception": null,
+        "interpretation": {
+          "version": 1,
+          "flags": 2,
+          "l0": 1001,
+          "l1": 30,
+          "l2": 8,
+          "kdf_algorithm": "'SP800_108_CTR_HMAC'",
+          "secret_algorithm": "''",
+          "domain_name": "''",
+          "forest_name": "''",
+          "private_key_length": 512,
+          "public_key_length": 2048,
+          "kdf_parameters": {
+            "length": 0,
+            "hex": ""
+          },
+          "secret_parameters": {
+            "length": 0,
+            "hex": ""
+          },
+          "l1_key": {
+            "length": 0,
+            "hex": ""
+          },
+          "l2_key": {
+            "length": 0,
+            "hex": ""
+          }
+        }
+      },
+      "hardened": {
+        "accepted": false,
+        "exception": "ValueError"
+      }
+    },
+    {
+      "id": "envelope:terminator",
+      "struct": "envelope",
+      "category": "terminator",
+      "source_case": "envelope:term:replace-final-nul.forest_name.1",
+      "description": "replace the final NUL code unit of forest_name with 'A'",
+      "original_size": 292,
+      "minimized_size": 228,
+      "data_base64": "AQAAAEtEU0sCAAAA6QMAAB4AAAAIAAAA2hoplBsGfsFqOc4NErW2rSYAAAAYAAAABgAAABAAAAAAAgAAAAgAACAAAAAgAAAAIAAAACAAAABTAFAAOAAwADAAXwAxADAAOABfAEMAVABSAF8ASABNAEEAQwAAAAAAAAABAAAADgAAAAAAAABTSEE1MTIAAEQASAAAAEkWgsQQFMq1DxG351YJLHVhAGwAcABoAGEALQAxAC4AaQBuAHYAYQBsAGkAZAAAAGIAcgBhAHYAbwAtADEALgBpAG4AdgBhAGwAaQBkAEEA",
+      "checkpoint": 226,
+      "inspector": {
+        "deviation": "bad_terminator",
+        "field": "forest_name",
+        "detail": "final code unit 4100 at 226 is not NUL",
+        "span_start": null
+      },
+      "baseline": {
+        "accepted": true,
+        "exception": null,
+        "interpretation": {
+          "version": 1,
+          "flags": 2,
+          "l0": 1001,
+          "l1": 30,
+          "l2": 8,
+          "kdf_algorithm": "'SP800_108_CTR_HMAC'",
+          "secret_algorithm": "'DH'",
+          "domain_name": "'alpha-1.invalid'",
+          "forest_name": "'bravo-1.invalid'",
+          "private_key_length": 512,
+          "public_key_length": 2048,
+          "kdf_parameters": {
+            "length": 24,
+            "hex": "00000000010000000e000000000000005348413531320000"
+          },
+          "secret_parameters": {
+            "length": 16,
+            "hex": "491682c41014cab50f11b7e756092c75"
+          },
+          "l1_key": {
+            "length": 0,
+            "hex": ""
+          },
+          "l2_key": {
+            "length": 0,
+            "hex": ""
+          }
+        }
+      },
+      "hardened": {
+        "accepted": false,
+        "exception": "ValueError"
+      }
+    },
+    {
+      "id": "envelope:flags",
+      "struct": "envelope",
+      "category": "flags",
+      "source_case": "envelope:flags:public-l2-mismatch.1",
+      "description": "public flag set while l2_key is 34 bytes for public_key_length 2048 bits",
+      "original_size": 292,
+      "minimized_size": 260,
+      "data_base64": "AQAAAEtEU0sDAAAA6QMAAB4AAAAIAAAA2hoplBsGfsFqOc4NErW2rSYAAAAYAAAABgAAABAAAAAAAgAAAAgAACAAAAAiAAAAIAAAACAAAABTAFAAOAAwADAAXwAxADAAOABfAEMAVABSAF8ASABNAEEAQwAAAAAAAAABAAAADgAAAAAAAABTSEE1MTIAAEQASAAAAEkWgsQQFMq1DxG351YJLHVhAGwAcABoAGEALQAxAC4AaQBuAHYAYQBsAGkAZAAAAGIAcgBhAHYAbwAtADEALgBpAG4AdgBhAGwAaQBkAAAA8EqddzqOrU5hxFPWMVzsfwGRFZ0GwCSc0yiymKZ5Y84=",
+      "checkpoint": 260,
+      "inspector": {
+        "deviation": "length_overrun",
+        "field": "l2_key",
+        "detail": "declared 34 bytes from 260 ends at 294, buffer is 260",
+        "span_start": null
+      },
+      "baseline": {
+        "accepted": true,
+        "exception": null,
+        "interpretation": {
+          "version": 1,
+          "flags": 3,
+          "l0": 1001,
+          "l1": 30,
+          "l2": 8,
+          "kdf_algorithm": "'SP800_108_CTR_HMAC'",
+          "secret_algorithm": "'DH'",
+          "domain_name": "'alpha-1.invalid'",
+          "forest_name": "'bravo-1.invalid'",
+          "private_key_length": 512,
+          "public_key_length": 2048,
+          "kdf_parameters": {
+            "length": 24,
+            "hex": "00000000010000000e000000000000005348413531320000"
+          },
+          "secret_parameters": {
+            "length": 16,
+            "hex": "491682c41014cab50f11b7e756092c75"
+          },
+          "l1_key": {
+            "length": 32,
+            "hex": "f04a9d773a8ead4e61c453d6315cec7f0191159d06c0249cd328b298a67963ce"
+          },
+          "l2_key": {
+            "length": 0,
+            "hex": ""
+          }
+        }
+      },
+      "hardened": {
+        "accepted": false,
+        "exception": "ValueError"
+      }
+    },
+    {
+      "id": "key_identifier:truncation",
+      "struct": "key_identifier",
+      "category": "truncation",
+      "source_case": "key_identifier:truncate-1",
+      "description": "drop final 1 byte(s) of a legal sample",
+      "original_size": 179,
+      "minimized_size": 148,
+      "data_base64": "AQAAAEtEU0sAAAAA6AMAAB8AAAAHAAAA/HRB8MGYYRiOweRfdSjecEAAAAAgAAAAIAAAABIDHZ5/kB9+ldJTgqrVYBLZZPHfppANARpvbIomxyt/vRH1rY3atEEaEytFadb1XtVOoA0ILb+KV7Q31f/1x/thAGwAcABoAGEALQAwAC4AaQBuAHYAYQBsAGkAZAAAAA==",
+      "checkpoint": 148,
+      "inspector": {
+        "deviation": "length_overrun",
+        "field": "forest_name",
+        "detail": "declared 32 bytes from 148 ends at 180, buffer is 148",
+        "span_start": null
+      },
+      "baseline": {
+        "accepted": true,
+        "exception": null,
+        "interpretation": {
+          "version": 1,
+          "flags": 0,
+          "l0": 1000,
+          "l1": 31,
+          "l2": 7,
+          "domain_name": "'alpha-0.invalid'",
+          "forest_name": "''",
+          "key_info": {
+            "length": 64,
+            "hex": "12031d9e7f901f7e95d25382aad56012d964f1dfa6900d011a6f6c8a26c72b7fbd11f5ad8ddab4411a132b4569d6f55ed54ea00d082dbf8a57b437d5fff5c7fb"
+          }
+        }
+      },
+      "hardened": {
+        "accepted": false,
+        "exception": "ValueError"
+      }
+    },
+    {
+      "id": "key_identifier:trailing",
+      "struct": "key_identifier",
+      "category": "trailing",
+      "source_case": "key_identifier:trailing-4",
+      "description": "append 4 bytes after the final declared field",
+      "original_size": 184,
+      "minimized_size": 181,
+      "data_base64": "AQAAAEtEU0sAAAAA6AMAAB8AAAAHAAAA/HRB8MGYYRiOweRfdSjecEAAAAAgAAAAIAAAABIDHZ5/kB9+ldJTgqrVYBLZZPHfppANARpvbIomxyt/vRH1rY3atEEaEytFadb1XtVOoA0ILb+KV7Q31f/1x/thAGwAcABoAGEALQAwAC4AaQBuAHYAYQBsAGkAZAAAAGIAcgBhAHYAbwAtADAALgBpAG4AdgBhAGwAaQBkAAAA3g==",
+      "checkpoint": 180,
+      "inspector": {
+        "deviation": "trailing_bytes",
+        "field": null,
+        "detail": "1 bytes after the last field",
+        "span_start": null
+      },
+      "baseline": {
+        "accepted": true,
+        "exception": null,
+        "interpretation": {
+          "version": 1,
+          "flags": 0,
+          "l0": 1000,
+          "l1": 31,
+          "l2": 7,
+          "domain_name": "'alpha-0.invalid'",
+          "forest_name": "'bravo-0.invalid'",
+          "key_info": {
+            "length": 64,
+            "hex": "12031d9e7f901f7e95d25382aad56012d964f1dfa6900d011a6f6c8a26c72b7fbd11f5ad8ddab4411a132b4569d6f55ed54ea00d082dbf8a57b437d5fff5c7fb"
+          }
+        }
+      },
+      "hardened": {
+        "accepted": false,
+        "exception": "ValueError"
+      }
+    },
+    {
+      "id": "key_identifier:length_prefix",
+      "struct": "key_identifier",
+      "category": "length_prefix",
+      "source_case": "key_identifier:len:domain_name_len.plus-two.1",
+      "description": "domain_name_len length 32 -> 34",
+      "original_size": 180,
+      "minimized_size": 150,
+      "data_base64": "AQAAAEtEU0sBAAAA6QMAAB4AAAAIAAAA2hoplBsGfsFqOc4NErW2rUAAAAAiAAAAIAAAALXJA6YLPfjpg6wXb34zbCa5aVjBKrQbzclDe693Qc117ZgTznSq5oG+LoZHs3nfKVCadZ31mzOWzumxdrkzouFhAGwAcABoAGEALQAxAC4AaQBuAHYAYQBsAGkAZAAAAGIA",
+      "checkpoint": 148,
+      "inspector": {
+        "deviation": "bad_terminator",
+        "field": "domain_name",
+        "detail": "final code unit 6200 at 148 is not NUL",
+        "span_start": null
+      },
+      "baseline": {
+        "accepted": true,
+        "exception": null,
+        "interpretation": {
+          "version": 1,
+          "flags": 1,
+          "l0": 1001,
+          "l1": 30,
+          "l2": 8,
+          "domain_name": "'alpha-1.invalid\\x00'",
+          "forest_name": "''",
+          "key_info": {
+            "length": 64,
+            "hex": "b5c903a60b3df8e983ac176f7e336c26b96958c12ab41bcdc9437baf7741cd75ed9813ce74aae681be2e8647b379df29509a759df59b3396cee9b176b933a2e1"
+          }
+        }
+      },
+      "hardened": {
+        "accepted": false,
+        "exception": "ValueError"
+      }
+    },
+    {
+      "id": "key_identifier:terminator",
+      "struct": "key_identifier",
+      "category": "terminator",
+      "source_case": "key_identifier:term:shifted-boundary.forest_name.1",
+      "description": "move forest_name boundary one code unit earlier; final real char now sits at the old NUL",
+      "original_size": 180,
+      "minimized_size": 180,
+      "data_base64": "AQAAAEtEU0sBAAAA6QMAAB4AAAAIAAAA2hoplBsGfsFqOc4NErW2rUAAAAAgAAAAIAAAALXJA6YLPfjpg6wXb34zbCa5aVjBKrQbzclDe693Qc117ZgTznSq5oG+LoZHs3nfKVCadZ31mzOWzumxdrkzouFhAGwAcABoAGEALQAxAC4AaQBuAHYAYQBsAGkAZAAAAGIAcgBhAHYAbwAtADEALgBpAG4AdgBhAGwAaQAAAGQA",
+      "checkpoint": 178,
+      "inspector": {
+        "deviation": "bad_terminator",
+        "field": "forest_name",
+        "detail": "final code unit 6400 at 178 is not NUL",
+        "span_start": null
+      },
+      "baseline": {
+        "accepted": true,
+        "exception": null,
+        "interpretation": {
+          "version": 1,
+          "flags": 1,
+          "l0": 1001,
+          "l1": 30,
+          "l2": 8,
+          "domain_name": "'alpha-1.invalid'",
+          "forest_name": "'bravo-1.invali\\x00'",
+          "key_info": {
+            "length": 64,
+            "hex": "b5c903a60b3df8e983ac176f7e336c26b96958c12ab41bcdc9437baf7741cd75ed9813ce74aae681be2e8647b379df29509a759df59b3396cee9b176b933a2e1"
+          }
+        }
+      },
+      "hardened": {
+        "accepted": false,
+        "exception": "ValueError"
+      }
+    },
+    {
+      "id": "key_identifier:boundary",
+      "struct": "key_identifier",
+      "category": "boundary",
+      "source_case": "key_identifier:compensated:domain_name_len:forest_name_len.1",
+      "description": "domain_name_len grows +2 into forest_name_len, forest_name_len shrinks -2; total length fixed",
+      "original_size": 180,
+      "minimized_size": 150,
+      "data_base64": "AQAAAEtEU0sBAAAA6QMAAB4AAAAIAAAA2hoplBsGfsFqOc4NErW2rUAAAAAiAAAAHgAAALXJA6YLPfjpg6wXb34zbCa5aVjBKrQbzclDe693Qc117ZgTznSq5oG+LoZHs3nfKVCadZ31mzOWzumxdrkzouFhAGwAcABoAGEALQAxAC4AaQBuAHYAYQBsAGkAZAAAAGIA",
+      "checkpoint": 148,
+      "inspector": {
+        "deviation": "bad_terminator",
+        "field": "domain_name",
+        "detail": "final code unit 6200 at 148 is not NUL",
+        "span_start": null
+      },
+      "baseline": {
+        "accepted": true,
+        "exception": null,
+        "interpretation": {
+          "version": 1,
+          "flags": 1,
+          "l0": 1001,
+          "l1": 30,
+          "l2": 8,
+          "domain_name": "'alpha-1.invalid\\x00'",
+          "forest_name": "''",
+          "key_info": {
+            "length": 64,
+            "hex": "b5c903a60b3df8e983ac176f7e336c26b96958c12ab41bcdc9437baf7741cd75ed9813ce74aae681be2e8647b379df29509a759df59b3396cee9b176b933a2e1"
+          }
+        }
+      },
+      "hardened": {
+        "accepted": false,
+        "exception": "ValueError"
+      }
+    },
+    {
+      "id": "key_identifier:length_prefix",
+      "struct": "key_identifier",
+      "category": "length_prefix",
+      "source_case": "key_identifier:len:key_info_len.u32-max.1",
+      "description": "key_info_len length 64 -> 4294967295",
+      "original_size": 180,
+      "minimized_size": 52,
+      "data_base64": "AQAAAEtEU0sBAAAA6QMAAB4AAAAIAAAA2hoplBsGfsFqOc4NErW2rf////8gAAAAIAAAAA==",
+      "checkpoint": 52,
+      "inspector": {
+        "deviation": "length_overrun",
+        "field": "key_info",
+        "detail": "declared 4294967295 bytes from 52 ends at 4294967347, buffer is 52",
+        "span_start": null
+      },
+      "baseline": {
+        "accepted": true,
+        "exception": null,
+        "interpretation": {
+          "version": 1,
+          "flags": 1,
+          "l0": 1001,
+          "l1": 30,
+          "l2": 8,
+          "domain_name": "''",
+          "forest_name": "''",
+          "key_info": {
+            "length": 0,
+            "hex": ""
+          }
+        }
+      },
+      "hardened": {
+        "accepted": false,
+        "exception": "ValueError"
+      }
+    }
+  ]
+}
